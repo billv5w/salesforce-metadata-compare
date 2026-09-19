@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Metadata Compare Tool</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/kit/theme.css">
+<style>
+  body { font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+
+  /* Brand override: mct's warm orange/terracotta accent, kept distinct from
+     the kit's default GitHub-blue accent (a deliberate identity choice, not
+     a drift to reconcile — see compare-ui-kit's README). Matches every
+     selector shape theme.css itself uses so the override wins regardless of
+     explicit data-theme or system color-scheme. */
+  :root,
+  :root[data-theme="dark"],
+  :root[data-theme="light"] {
+    --accent: #CF7752;
+    --accent-hover: #D98A68;
+    --accent-dim: rgba(207, 119, 82, 0.13);
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme]) {
+      --accent: #CF7752;
+      --accent-hover: #D98A68;
+      --accent-dim: rgba(207, 119, 82, 0.13);
+    }
+  }
+</style>
+</head>
+<body>
+<script src="/kit/shell.js"></script>
+<script src="/kit/orchestrator.js"></script>
+<script src="orchestrator.js"></script>
+</body>
+</html>

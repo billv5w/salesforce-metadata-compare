@@ -1,0 +1,52 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+
+# Claude Code IDE state and skills
+.claude/
+
+# Salesforce local tooling state; can contain org-linked data
+.sfdx/
+.sf/
+
+# Metadata compare tool — local state and large snapshots (regenerate with scripts)
+.metadata-compare/
+.metadata-compare-tool/
+retrieved-*/
+docs/env-reports/
+
+# Git worktrees
+.worktrees/
+
+# Node / Playwright
+node_modules/
+playwright-report/
+test-results/
+blob-report/
+.playwright/
+
+# Generated manifests and local credentials
+/manifest/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.log
+
+# Local assistant/editor state and coverage output
+.codex/
+.agents/
+.vscode/
+.coverage
+htmlcov/
+coverage/

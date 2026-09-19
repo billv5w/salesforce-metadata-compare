@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mct — metadata diff</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/kit/theme.css">
+<link rel="stylesheet" href="/kit/vendor/diff2html.min.css">
+<style>
+  body { font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace; }
+
+  /* mct-specific sidebar/header extras the kit doesn't own (folder-actions,
+     type pills, view-mode toggle are metadata-compare concepts, not generic
+     shell chrome). */
+  .view-toggle { display: flex; gap: 4px; }
+  #type-filters { display: flex; flex-wrap: wrap; gap: 4px; padding: 6px 8px; }
+  .type-pill { font-size: 11px; padding: 2px 8px; }
+  .folder-actions { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 8px 8px; border-bottom: 1px solid var(--border-subtle); }
+  .folder-actions .kit-btn { font-size: 11px; padding: 3px 7px; }
+</style>
+</head>
+<body>
+<div id="loading" class="kit-loading">Running comparison…</div>
+<script src="/kit/vendor/diff2html.min.js"></script>
+<script src="/kit/shell.js"></script>
+<script src="diff.js"></script>
+</body>
+</html>
