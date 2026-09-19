@@ -61,7 +61,8 @@ test.describe("Safety contract — CLI read-only commands", () => {
   test("--help exits cleanly", () => {
     const result = runEnvCompare("--help");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toMatch(/hardened metadata compare/i);
+    expect(result.stdout).toMatch(/compare salesforce metadata/i);
+    expect(result.stdout).toMatch(/nothing is deployed or pushed/i);
   });
 });
 

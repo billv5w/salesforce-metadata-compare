@@ -640,7 +640,10 @@ class Handler(BaseUIHandler):
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Serve orchestration UI")
+    p = argparse.ArgumentParser(
+        prog="mct start",
+        description="Start the local web interface for creating snapshots and comparing metadata.",
+    )
     p.add_argument(
         "--port",
         type=int,
@@ -649,7 +652,7 @@ def parse_args() -> argparse.Namespace:
         help="Listen port (default 8091). Use 0 for an OS-assigned free port. "
         "If the chosen port is busy, the next free port is tried automatically.",
     )
-    p.add_argument("--no-open", action="store_true")
+    p.add_argument("--no-open", action="store_true", help="Do not open a browser automatically.")
     return p.parse_args()
 
 

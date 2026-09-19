@@ -68,7 +68,7 @@ def workspaces_path() -> Path:
 
 
 # Salesforce DX project root (git + sf cwd, manifest/ lives here).
-PROJECT_ROOT = BUNDLE_ROOT
+PROJECT_ROOT = Path.cwd().resolve()
 # Snapshot trees, packages JSON, and snapshots.json — per-user data dir,
 # outside the installed package, keyed by project.
 STORAGE_ROOT = data_root() / "snapshot-store" / "initial"
@@ -99,6 +99,17 @@ def _storage_key(project_root: Path) -> str:
     return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
 
+def require_dx_project() -> None:
+    """Fail with a clear message when PROJECT_ROOT is not a Salesforce DX project."""
+    if not (PROJECT_ROOT / "sfdx-project.json").is_file():
+        print(
+            f"\u2717 {PROJECT_ROOT} is not a Salesforce DX project (no sfdx-project.json found).\n"
+            "  Run mct from inside your DX project, or pass --repo-root /path/to/dx-project.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+
 def apply_repo_root(repo_root: str | None) -> None:
     """Set DX project root (git/sf) and per-project snapshot storage under the
     per-user data root (MCT_DATA_DIR or the platform's data location)."""
@@ -106,7 +117,7 @@ def apply_repo_root(repo_root: str | None) -> None:
     if repo_root:
         PROJECT_ROOT = Path(repo_root).expanduser().resolve()
     else:
-        PROJECT_ROOT = BUNDLE_ROOT.resolve()
+        PROJECT_ROOT = Path.cwd().resolve()
     STORAGE_ROOT = (
         data_root() / "snapshot-store" / _storage_key(PROJECT_ROOT)
     )

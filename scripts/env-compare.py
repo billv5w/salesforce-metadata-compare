@@ -218,12 +218,29 @@ setattr(sys.modules[__name__], "apply_repo_root", apply_repo_root)
 # CLI entry point
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Hardened metadata compare orchestrator.")
+    p = argparse.ArgumentParser(
+        prog="mct",
+        description=(
+            "Compare Salesforce metadata across Git branches, orgs, and installed packages. "
+            "Nothing is deployed or pushed."
+        ),
+        epilog=(
+            "Web interface:\n"
+            "  mct start [--port N] [--no-open]\n"
+            "      Open the local web interface (also the default when no command is given).\n\n"
+            "Typical CLI flow, run from inside your DX project:\n"
+            "  mct snapshot-all --branch main --org my-sandbox\n"
+            "  mct list\n"
+            "  mct ui --left <branch-snapshot-id> --right <org-snapshot-id>\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p.add_argument(
         "--repo-root",
         default=None,
         metavar="PATH",
-        help="Salesforce DX project root (git repo with force-app). Default: this repository root.",
+        help="Salesforce DX project (the folder containing sfdx-project.json). "
+             "Default: the current directory.",
     )
     p.add_argument(
         "--api-version",
@@ -242,11 +259,11 @@ def parse_args() -> argparse.Namespace:
     )
     sub = p.add_subparsers(dest="command", required=True)
 
-    sp_list = sub.add_parser("list", help="List known snapshots from index.")
+    sp_list = sub.add_parser("list", help="List saved snapshots for this project.")
     sp_list.add_argument("--json", action="store_true", help="Print snapshots as JSON.")
     sp_list.set_defaults(_fn="list")
 
-    sp_branch = sub.add_parser("snapshot-branch", help="Create read-only branch snapshot.")
+    sp_branch = sub.add_parser("snapshot-branch", help="Save a snapshot of a Git branch's metadata source (no checkout needed).")
     sp_branch.add_argument("--branch", required=True, help="Branch name to snapshot.")
     sp_branch.add_argument(
         "--source-subdir",
@@ -260,7 +277,7 @@ def parse_args() -> argparse.Namespace:
     sp_branch.add_argument("--fetch", action="store_true", help="Run read-only git fetch before resolving branch.")
     sp_branch.set_defaults(_fn="snapshot_branch")
 
-    sp_src = sub.add_parser("snapshot-org-from-source", help="Retrieve org using source-derived manifest.")
+    sp_src = sub.add_parser("snapshot-org-from-source", help="Snapshot a branch, then retrieve the same components from an org.")
     sp_src.add_argument("--org", required=True, help="Salesforce org alias.")
     sp_src.add_argument("--branch", required=True, help="Branch to snapshot for manifest source.")
     sp_src.add_argument(
@@ -275,7 +292,7 @@ def parse_args() -> argparse.Namespace:
 
     sp_ret_src = sub.add_parser(
         "retrieve-org-from-branch-snapshot",
-        help="After a branch snapshot exists: generate manifest from that tree and retrieve from org.",
+        help="Retrieve from an org the components listed in an existing branch snapshot.",
     )
     sp_ret_src.add_argument("--org", required=True, help="Salesforce org alias.")
     sp_ret_src.add_argument(
@@ -287,7 +304,7 @@ def parse_args() -> argparse.Namespace:
     sp_ret_src.add_argument("--wait-seconds", type=int, default=120)
     sp_ret_src.set_defaults(_fn="retrieve_org_from_branch_snapshot")
 
-    sp_org = sub.add_parser("snapshot-org-from-org", help="Retrieve org using org-derived manifest.")
+    sp_org = sub.add_parser("snapshot-org-from-org", help="Retrieve everything an org reports for its metadata types.")
     sp_org.add_argument("--org", required=True, help="Salesforce org alias.")
     sp_org.add_argument("--wait-seconds", type=int, default=120)
     sp_org.set_defaults(_fn="snapshot_org_from_org")
@@ -295,8 +312,8 @@ def parse_args() -> argparse.Namespace:
     sp_bidi = sub.add_parser(
         "snapshot-org-bidirectional",
         help=(
-            "Retrieve org using a UNION manifest (source manifest + org manifest scoped to "
-            "source-tracked types) so the compare sees drift in both directions."
+            "Snapshot a branch and retrieve from the org both the branch's components and any "
+            "org-only components of the same types, so drift is visible in both directions."
         ),
     )
     sp_bidi.add_argument("--org", required=True, help="Salesforce org alias.")
@@ -324,8 +341,8 @@ def parse_args() -> argparse.Namespace:
     sp_rdelta = sub.add_parser(
         "retrieve-delta",
         help=(
-            "Reverse-sync (org → git): retrieve ONLY the org-side drift (changed + "
-            "org-only components, minus baseline) into a fresh folder for PR-ing."
+            "Retrieve only the components that differ on the org side (changed and org-only, "
+            "excluding accepted/ignored drift) into a new snapshot you can bring back into Git."
         ),
     )
     sp_rdelta.add_argument("--left", required=True, metavar="PATH|SNAP_ID",
@@ -341,11 +358,10 @@ def parse_args() -> argparse.Namespace:
     sp_val = sub.add_parser(
         "validate-deploy",
         help=(
-            "Validate (check-only, --dry-run) that the left→right delta would deploy "
-            "cleanly to an org. NOTHING is saved to the org. Supports Copado-style "
-            "clean-and-retry and no-grant permission stripping. Deltas containing "
-            "target-only deletions are outside validation scope — they are reported "
-            "and refused, never treated as successfully validated."
+            "Check whether the left-to-right changes would deploy to an org, using a "
+            "Salesforce check-only (--dry-run) deployment. Nothing is saved to the org. "
+            "Deltas that include target-only deletions are reported and refused, since "
+            "check-only validation cannot cover deletions."
         ),
     )
     sp_val.add_argument("--left", required=True, metavar="PATH|SNAP_ID",
@@ -368,7 +384,7 @@ def parse_args() -> argparse.Namespace:
                         help="Include baseline-ignored/accepted drift in the validated delta.")
     sp_val.set_defaults(_fn="validate_deploy")
 
-    sp_all = sub.add_parser("snapshot-all", help="Create branch + both org retrieval snapshots.")
+    sp_all = sub.add_parser("snapshot-all", help="One-shot: snapshot a branch, retrieve the org two ways, and record installed packages.")
     sp_all.add_argument("--branch", required=True, help="Branch to snapshot.")
     sp_all.add_argument("--org", required=True, help="Salesforce org alias.")
     sp_all.add_argument(
@@ -381,7 +397,7 @@ def parse_args() -> argparse.Namespace:
     sp_all.add_argument("--wait-seconds", type=int, default=120)
     sp_all.set_defaults(_fn="snapshot_all")
 
-    sp_ui = sub.add_parser("ui", help="Launch diff UI for any two snapshots/paths.")
+    sp_ui = sub.add_parser("ui", help="Open the diff viewer for two snapshots or folders.")
     sp_ui.add_argument("--left", required=True, help="Snapshot id or repo-relative path.")
     sp_ui.add_argument("--right", required=True, help="Snapshot id or repo-relative path.")
     sp_ui.add_argument("--port", type=int, default=8089)
@@ -396,14 +412,14 @@ def parse_args() -> argparse.Namespace:
 
     sp_snap_pkg = sub.add_parser(
         "snapshot-packages",
-        help="Save sf package installed list JSON (read-only) under .metadata-compare/.",
+        help="Save the list of packages installed in an org as a snapshot.",
     )
     sp_snap_pkg.add_argument("--org", required=True, help="Salesforce org alias.")
     sp_snap_pkg.set_defaults(_fn="snapshot_packages")
 
     sp_cmp_pkg = sub.add_parser(
         "compare-packages",
-        help="Markdown report comparing two installed-package snapshot files or ids.",
+        help="Compare two installed-package snapshots (Markdown or JSON report).",
     )
     sp_cmp_pkg.add_argument("--left", required=True, help="Snapshot id or repo-relative path to packages JSON.")
     sp_cmp_pkg.add_argument("--right", required=True, help="Snapshot id or repo-relative path to packages JSON.")
@@ -418,14 +434,14 @@ def parse_args() -> argparse.Namespace:
 
     sp_verify = sub.add_parser(
         "verify-snapshot",
-        help="Verify a snapshot path exists under storage and count files (sanity-check after retrieve).",
+        help="Check that a snapshot exists on disk and report its file count.",
     )
     sp_verify.add_argument("--id", required=True, dest="snapshot_id", metavar="ID", help="Snapshot id from list.")
     sp_verify.set_defaults(_fn="verify_snapshot")
 
     sp_del = sub.add_parser(
         "delete-snapshots",
-        help="Remove snapshot index entries and delete artifacts under snapshot storage for this repo.",
+        help="Delete saved snapshots for this project (local storage only).",
     )
     sp_del.add_argument(
         "--id",
@@ -439,7 +455,7 @@ def parse_args() -> argparse.Namespace:
     sp_del.add_argument("--force", action="store_true", help="Required with --all.")
     sp_del.set_defaults(_fn="delete_snapshots")
 
-    sp_hist = sub.add_parser("history", help="List past comparison runs (newest first).")
+    sp_hist = sub.add_parser("history", help="Show past comparison results for this project (newest first).")
     sp_hist.add_argument("--json", action="store_true", help="Print as JSON.")
     sp_hist.add_argument("--left", default=None, metavar="FILTER",
                          help="Filter history to runs where left path contains FILTER.")
@@ -449,7 +465,7 @@ def parse_args() -> argparse.Namespace:
                          help="Chronological drift counts (oldest first) with up/down markers.")
     sp_hist.set_defaults(_fn="history")
 
-    sp_diff = sub.add_parser("diff", help="Compare two snapshots/paths; exit 1 if --fail-on-diff.")
+    sp_diff = sub.add_parser("diff", help="Compare two snapshots or folders and print a summary; use --fail-on-diff for CI.")
     sp_diff.add_argument("--left", required=True, metavar="PATH|SNAP_ID",
                          help="Left tree: path or snapshot ID.")
     sp_diff.add_argument("--right", required=True, metavar="PATH|SNAP_ID",
@@ -489,7 +505,7 @@ def parse_args() -> argparse.Namespace:
 
     sp_base = sub.add_parser(
         "baseline",
-        help="Show or edit the project baseline (ignore rules + accepted diffs).",
+        help="Show or edit the baseline: ignore rules and accepted differences.",
     )
     base_sub = sp_base.add_subparsers(dest="baseline_cmd", required=True)
     bs_show = base_sub.add_parser("show", help="Print baseline rules and accepted-diff entries.")
@@ -519,7 +535,7 @@ def parse_args() -> argparse.Namespace:
 
     sp_matrix = sub.add_parser(
         "compare-matrix",
-        help="Compare multiple snapshot pairs and print a summary table.",
+        help="Compare several snapshot pairs at once and print a summary table.",
     )
     sp_matrix.add_argument(
         "--pair",
@@ -539,7 +555,7 @@ def parse_args() -> argparse.Namespace:
 
     sp_attr = sub.add_parser(
         "attribute",
-        help="Who changed what, when — SetupAuditTrail entries (read-only SOQL).",
+        help="Show who changed what in an org recently (reads SetupAuditTrail via read-only SOQL).",
     )
     sp_attr.add_argument("--org", required=True)
     sp_attr.add_argument("--since-days", type=int, default=14)
@@ -550,8 +566,8 @@ def parse_args() -> argparse.Namespace:
 
     sp_mig = sub.add_parser(
         "migrate",
-        help="Copy legacy snapshot/workspaces data into the per-user data "
-             "location (non-destructive; originals are left in place).",
+        help="Copy snapshot and workspace data from an older installation into the "
+             "per-user data location (originals are left in place).",
     )
     sp_mig.add_argument(
         "--legacy-root",
@@ -568,6 +584,18 @@ def parse_args() -> argparse.Namespace:
 # Patch parse_args onto the module too
 setattr(sys.modules[__name__], "parse_args", parse_args)
 
+# Commands that run git/sf against the DX project and therefore need one.
+_NEEDS_DX_PROJECT = frozenset({
+    "snapshot_branch",
+    "snapshot_org_from_source",
+    "retrieve_org_from_branch_snapshot",
+    "snapshot_org_from_org",
+    "snapshot_org_bidirectional",
+    "retrieve_delta",
+    "validate_deploy",
+    "snapshot_all",
+})
+
 
 def main() -> int:
     args = parse_args()
@@ -577,6 +605,8 @@ def main() -> int:
     api_ver = normalize_api_version(
         (getattr(args, "api_version", None) or DEFAULT_API_VERSION).strip() or DEFAULT_API_VERSION
     )
+    if args._fn in _NEEDS_DX_PROJECT:
+        _cfg.require_dx_project()
     try:
         if args._fn == "list":
             return print_snapshots(as_json=args.json)
