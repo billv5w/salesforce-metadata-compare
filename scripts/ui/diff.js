@@ -147,6 +147,39 @@
         "Profile / permission-set diffs may be scope artifacts of differing retrieve requests (not real drift) — left and right were retrieved with different scope."
       );
     }
+
+    // Server-computed retrieval-completeness warnings: skipped org types,
+    // retrieve warnings, API-version mismatch — an incomplete snapshot must
+    // never read as a trustworthy clean comparison.
+    if (Array.isArray(s.provenance_warnings)) {
+      for (const w of s.provenance_warnings) warns.push(w);
+    }
+    // The recorded per-component retrieve failures themselves — a count
+    // alone doesn't tell the reviewer which components may be missing.
+    for (const [label, info] of [
+      ["Left", li],
+      ["Right", ri],
+    ]) {
+      const rw = (info && info.retrieve_warnings) || [];
+      const shown = rw.slice(0, 10);
+      for (const w of shown) warns.push(`${label} retrieve warning: ${w}`);
+      if (rw.length > shown.length) {
+        warns.push(
+          `${label} snapshot: …and ${rw.length - shown.length} more retrieve warning(s) (see the exported report).`
+        );
+      }
+    }
+
+    // Effective type scope — a filtered comparison is not a complete one.
+    const sc = s.scope || {};
+    if (sc.include_types && sc.include_types.length) {
+      warns.push(
+        `Comparison scoped to metadata type(s): ${sc.include_types.join(", ")} — other types are hidden from this view.`
+      );
+    }
+    if (sc.exclude_types && sc.exclude_types.length) {
+      warns.push(`Metadata type(s) excluded from this view: ${sc.exclude_types.join(", ")}.`);
+    }
     return warns;
   }
 
@@ -539,6 +572,29 @@
       ""
     );
 
+    const sc = s.scope || {};
+    if (sc.include_types && sc.include_types.length) {
+      lines.push(
+        `> [!NOTE]`,
+        `> Comparison scoped to metadata type(s): **${sc.include_types.join(", ")}** — other types are not shown in this report.`,
+        ""
+      );
+    }
+    if (sc.exclude_types && sc.exclude_types.length) {
+      lines.push(
+        `> [!NOTE]`,
+        `> Metadata type(s) excluded from this comparison: **${sc.exclude_types.join(", ")}**.`,
+        ""
+      );
+    }
+
+    const mdWarnings = buildWarnings();
+    if (mdWarnings.length) {
+      lines.push("## Snapshot completeness warnings", "");
+      mdWarnings.forEach((w) => lines.push(`- ⚠️ ${w}`));
+      lines.push("");
+    }
+
     if (s.different_count === 0 && s.only_left_count === 0 && s.only_right_count === 0) {
       lines.push("> [!NOTE]", "> No drift detected between left and right.", "");
     } else {
@@ -562,7 +618,9 @@
       if (!items.length) return;
       lines.push(`<details><summary>${title} (${items.length})</summary>`, "");
       lines.push("| Path |", "| --- |");
-      items.forEach((i) => lines.push(`| \`${i.path}\` |`));
+      items.forEach((i) =>
+        lines.push(`| \`${i.path}\`${i.binary ? " — binary content changed" : ""} |`)
+      );
       lines.push("", "</details>", "");
     };
     section("Changed", s.differ);

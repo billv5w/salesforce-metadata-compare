@@ -160,25 +160,57 @@ def read_package_dirs_from_branch(ref: str) -> list[str]:
         return ["force-app"]
 
 
+def _check_tar_member(root: Path, member: tarfile.TarInfo, rel_name: str | None = None) -> Path:
+    """Validate one archive member for extraction under *root*; return its
+    resolved target path.
+
+    Metadata archives must contain only directories and regular files
+    located inside the destination: symbolic and hard links, device/fifo
+    special files, absolute paths, and traversal are all rejected before
+    anything is written. Containment is checked on resolved path
+    components (``relative_to``), never string prefixes — a sibling like
+    ``out_evil`` is NOT inside ``out``.
+
+    *root* must already be resolved. *rel_name* defaults to the member
+    name; the merge path passes the subdir-relative name instead.
+    """
+    name = rel_name if rel_name is not None else member.name
+    if member.issym() or member.islnk():
+        raise RuntimeError(f"Tar member is a link (links are never extracted): {member.name}")
+    if not (member.isdir() or member.isfile()):
+        raise RuntimeError(
+            f"Tar member is not a file or directory (rejected): {member.name}"
+        )
+    target = (root / name).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise RuntimeError(f"Tar path escapes target: {member.name}") from None
+    return target
+
+
 def _extract_archive_to(ref: str, subdir: str, out_dir: Path) -> None:
-    """Extract git archive of ``ref:subdir`` into *out_dir* (security-checked)."""
+    """Extract git archive of ``ref:subdir`` into *out_dir* (security-checked).
+
+    Every member is validated before extraction on every supported Python
+    version — the tarfile ``filter=`` keyword (3.12+) is additional
+    hardening, not the primary guard.
+    """
     archive_bytes = _cfg.run(
         ["git", "archive", "--format=tar", ref, subdir],
         capture=True,
         text=False,
         timeout=120,
     ).stdout
-    out_str = str(out_dir.resolve())
+    out_resolved = out_dir.resolve()
     with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as tf:
+        members = tf.getmembers()
+        for m in members:
+            _check_tar_member(out_resolved, m)
         if sys.version_info >= (3, 12):
             tf.extractall(path=out_dir, filter="data")
         else:
-            safe = []
-            for m in tf.getmembers():
-                if not str((out_dir / m.name).resolve()).startswith(out_str):
-                    raise RuntimeError(f"Tar path escapes target: {m.name}")
-                safe.append(m)
-            tf.extractall(path=out_dir, members=safe)
+            tf.extractall(path=out_dir, members=members)
 
 
 def _merge_package_dirs(ref: str, pkg_dirs: list[str], out_dir: Path) -> tuple[Path, list[str]]:
@@ -197,7 +229,7 @@ def _merge_package_dirs(ref: str, pkg_dirs: list[str], out_dir: Path) -> tuple[P
     """
     merged_root = out_dir / "main" / "default"
     merged_root.mkdir(parents=True, exist_ok=True)
-    out_str = str(out_dir.resolve())
+    merged_resolved = merged_root.resolve()
 
     collisions: list[str] = []
     extracted_any = False
@@ -222,12 +254,12 @@ def _merge_package_dirs(ref: str, pkg_dirs: list[str], out_dir: Path) -> tuple[P
                 rel_path = member.name[len(prefix):]
                 if not rel_path:
                     continue
-                target = merged_root / rel_path
-                if not str(target.resolve()).startswith(out_str):
-                    raise RuntimeError(f"Tar path escapes target: {member.name}")
+                # Links, special files and escaping paths raise — unsafe
+                # members must never be silently discarded.
+                target = _check_tar_member(merged_resolved, member, rel_path)
                 if member.isdir():
                     target.mkdir(parents=True, exist_ok=True)
-                elif member.isfile():
+                else:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     if target.exists():
                         collisions.append(rel_path)
@@ -878,7 +910,10 @@ def retrieve_delta(
     deletions: list[str] = []
     for k in result.only_left_keys:
         lp, disp = result.left_ix[k]
-        status, _ = _bl.classify_entry(disp, lp, None, baseline, pair_key=pair_key)
+        status, _ = _bl.classify_entry(
+            disp, lp, None, baseline, pair_key=pair_key,
+            left_root=result.left_root, right_root=result.right_root,
+        )
         if status in ("active", "accepted_stale"):
             deletions.append(disp)
     deletions.sort()
@@ -895,7 +930,12 @@ def retrieve_delta(
 
     if delta_files:
         print(f"  Org-side drift: {len(delta_files)} file(s)", flush=True)
-        members, err = _delta.resolve_components_via_sf([p for p, _ in delta_files])
+        from mct.retrieved_folder_compare import check_metadata_read
+        safe_paths = [
+            check_metadata_read(result.right_root or right_abs, p)
+            for p, _ in delta_files
+        ]
+        members, err = _delta.resolve_components_via_sf(safe_paths)
         if members is None:
             raise RuntimeError(
                 f"Component resolution failed ({err}). retrieve-delta needs accurate "

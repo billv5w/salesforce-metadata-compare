@@ -85,7 +85,7 @@ def test_validation_excludes_accepted_custom_metadata_sibling(records, monkeypat
     left, right, selected, accepted, baseline_file = records
     current_baseline = baseline.load_baseline(baseline_file)
     monkeypatch.setattr(baseline, "load_baseline", lambda: current_baseline)
-    entries = validate._collect_delta(str(left), str(right), True)
+    entries, _destroy = validate._collect_delta(str(left), str(right), True)
     paths = {display for _, display in entries}
     assert selected in paths
     assert accepted not in paths, "dry-run source includes an unrelated accepted record"

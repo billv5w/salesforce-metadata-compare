@@ -179,20 +179,31 @@ def collect_deploy_files(
     """
     from mct.baseline import classify_entry
 
+    lroot = getattr(result, "left_root", None)
+    rroot = getattr(result, "right_root", None)
     deploy: list[tuple[Path, str]] = []
     destroy: list[tuple[Path, str]] = []
     for lp, rp, ld, _ in result.differ_pairs:
-        status, _ = classify_entry(ld, lp, rp, baseline, pair_key=pair_key)
+        status, _ = classify_entry(
+            ld, lp, rp, baseline, pair_key=pair_key,
+            left_root=lroot, right_root=rroot,
+        )
         if status in ("active", "accepted_stale"):
             deploy.append((lp, ld))
     for k in result.only_left_keys:
         lp, disp = result.left_ix[k]
-        status, _ = classify_entry(disp, lp, None, baseline, pair_key=pair_key)
+        status, _ = classify_entry(
+            disp, lp, None, baseline, pair_key=pair_key,
+            left_root=lroot, right_root=rroot,
+        )
         if status in ("active", "accepted_stale"):
             deploy.append((lp, disp))
     for k in result.only_right_keys:
         rp, disp = result.right_ix[k]
-        status, _ = classify_entry(disp, None, rp, baseline, pair_key=pair_key)
+        status, _ = classify_entry(
+            disp, None, rp, baseline, pair_key=pair_key,
+            left_root=lroot, right_root=rroot,
+        )
         if status in ("active", "accepted_stale"):
             destroy.append((rp, disp))
     return deploy, destroy
@@ -210,14 +221,22 @@ def collect_reverse_sync_files(
     """
     from mct.baseline import classify_entry
 
+    lroot = getattr(result, "left_root", None)
+    rroot = getattr(result, "right_root", None)
     out: list[tuple[Path, str]] = []
     for lp, rp, ld, _ in result.differ_pairs:
-        status, _detail = classify_entry(ld, lp, rp, baseline, pair_key=pair_key)
+        status, _detail = classify_entry(
+            ld, lp, rp, baseline, pair_key=pair_key,
+            left_root=lroot, right_root=rroot,
+        )
         if status in ("active", "accepted_stale"):
             out.append((rp, ld))
     for k in result.only_right_keys:
         rp, disp = result.right_ix[k]
-        status, _detail = classify_entry(disp, None, rp, baseline, pair_key=pair_key)
+        status, _detail = classify_entry(
+            disp, None, rp, baseline, pair_key=pair_key,
+            left_root=lroot, right_root=rroot,
+        )
         if status in ("active", "accepted_stale"):
             out.append((rp, disp))
     return out

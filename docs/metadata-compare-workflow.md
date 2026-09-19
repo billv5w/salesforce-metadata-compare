@@ -66,7 +66,7 @@ mct --repo-root /path/to/dx-project validate-deploy \
   --left <source-snapshot-id> --right <target-snapshot-id> --org target-sandbox
 ```
 
-Exit 0 means valid as authored, 1 means validation failed, and 2 means validation succeeded only after retry exclusions. Treat exit 2 as requiring review of the exclusion report.
+Exit 0 means valid as authored (or no active drift), 1 means validation failed — including a delta containing target-only deletions, which are outside this application's supported validation scope (a check-only deploy exercises what `package.xml` deploys; it can never cover `destructiveChanges.xml`), so the delta is refused and reported rather than partially validated — and 2 means validation succeeded only after retry exclusions. Treat exit 2 as requiring review of the exclusion report.
 
 ## Installed packages
 

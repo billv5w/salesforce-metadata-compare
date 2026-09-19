@@ -7,7 +7,9 @@ missing on one side due to casing. No dependency on the `diff` CLI.
 
 from __future__ import annotations
 
+import errno
 import filecmp
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -65,11 +67,101 @@ def norm_key(rel: Path) -> str:
     return rel.as_posix().lower()
 
 
+class LinkedMetadataError(RuntimeError):
+    """A file or directory inside a compared tree is a symbolic link.
+
+    Metadata trees must be real files: a link can point outside the
+    comparison root, leaking arbitrary local files into reports and
+    exports. Links are therefore rejected loudly rather than silently
+    skipped or followed.
+    """
+
+
+def check_metadata_read(root: Path, path: Path) -> Path:
+    """Verify *path* is safe to read as metadata inside trusted *root*;
+    return the resolved path.
+
+    Two independent fail-closed checks:
+
+    1. Containment — the fully resolved path must stay beneath the
+       resolved root. Links at or above the root itself (system aliases
+       like ``/tmp`` → ``/private/tmp``) resolve identically and stay
+       valid; the restriction only applies to metadata beneath the root.
+    2. No symlink components beneath the root — every component between
+       the root and the target is lstat-checked on the path's OWN
+       spelling. Resolving first and testing ``is_symlink()`` afterwards
+       would erase the evidence: a link pointing back inside the root
+       would pass containment and leak through the ancestor.
+
+    Raises LinkedMetadataError for links and escapes. Callers that cache
+    comparison results MUST re-verify at read time — a cached index path
+    can be swapped for a linked ancestor between requests.
+    """
+    root_path = Path(root)
+    p = Path(path)
+    if not p.is_absolute():
+        p = root_path / p
+    p = Path(os.path.normpath(str(p)))
+    root_res = root_path.resolve()
+    resolved = p.resolve()
+    try:
+        resolved.relative_to(root_res)
+    except ValueError:
+        raise LinkedMetadataError(
+            "Metadata path resolves outside its trusted comparison root "
+            f"(linked or traversed out of the tree): {p}"
+        ) from None
+    try:
+        rel_parts = p.relative_to(root_path).parts
+        walk_root = root_path
+    except ValueError:
+        try:
+            rel_parts = p.relative_to(root_res).parts
+            walk_root = root_res
+        except ValueError:
+            # Spelled outside both the given and the resolved root yet
+            # resolves inside — reachable only through a link.
+            raise LinkedMetadataError(
+                f"Metadata path is only reachable through a link: {p}"
+            ) from None
+    cur = walk_root
+    for part in rel_parts:
+        cur = cur / part
+        if cur.is_symlink():
+            raise LinkedMetadataError(
+                "Metadata path traverses a symbolic link beneath the "
+                f"comparison root (links are never read): {cur}"
+            )
+    return resolved
+
+
+def read_metadata_bytes(root: Path, path: Path) -> bytes:
+    """check_metadata_read + byte read, with a no-follow open on the leaf
+    where the platform supports it (O_NOFOLLOW) so a file swapped for a
+    link after the checks cannot be read through."""
+    safe = check_metadata_read(root, path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        with os.fdopen(os.open(safe, flags), "rb") as fh:
+            return fh.read()
+    except OSError as exc:
+        if exc.errno == errno.ELOOP or safe.is_symlink():
+            raise LinkedMetadataError(
+                f"Metadata file is a symbolic link (links are never read): {safe}"
+            ) from exc
+        raise
+
+
 def index_tree(base: Path) -> dict[str, tuple[Path, str]]:
     """Map norm_key -> (absolute path, display path relative to base)."""
     out: dict[str, tuple[Path, str]] = {}
     base = base.resolve()
     for p in base.rglob("*"):
+        if p.is_symlink():
+            raise LinkedMetadataError(
+                "Metadata tree contains a symbolic link (links are never "
+                f"followed or compared): {p.relative_to(base).as_posix()}"
+            )
         if not p.is_file():
             continue
         # Dotfiles (.gitkeep, .forceignore, .DS_Store) are git/OS placeholders —
@@ -95,6 +187,42 @@ class TreeCompareResult:
     # (left_abs, right_abs, left_disp, right_disp)
     differ_pairs: tuple[tuple[Path, Path, str, str], ...]
     identical_normalized_pairs: tuple[tuple[Path, Path, str, str], ...] = ()
+    # Resolved comparison roots — trusted anchors for check_metadata_read.
+    left_root: Path | None = None
+    right_root: Path | None = None
+    # In-scope reporting metrics, set only when a metadata-type scope was
+    # applied (apply_type_scope). The indexes and identical_count above stay
+    # whole-tree — companions, component expansion and destructive-overlap
+    # checks need that context — while scoped_* are the values summaries,
+    # history and reports must show so displayed numbers match the
+    # advertised filter. Never mix their denominators.
+    scoped_identical_count: int | None = None
+    scoped_total_left: int | None = None
+    scoped_total_right: int | None = None
+
+    @property
+    def visible_identical_count(self) -> int:
+        return (
+            self.identical_count
+            if self.scoped_identical_count is None
+            else self.scoped_identical_count
+        )
+
+    @property
+    def visible_total_left(self) -> int:
+        return (
+            len(self.left_ix)
+            if self.scoped_total_left is None
+            else self.scoped_total_left
+        )
+
+    @property
+    def visible_total_right(self) -> int:
+        return (
+            len(self.right_ix)
+            if self.scoped_total_right is None
+            else self.scoped_total_right
+        )
 
 
 def compare_trees(
@@ -146,4 +274,76 @@ def compare_trees(
         identical_count=identical_count,
         differ_pairs=tuple(differ_list),
         identical_normalized_pairs=tuple(identical_normalized_list),
+        left_root=left_root.resolve(),
+        right_root=right_root.resolve(),
+    )
+
+
+def type_scope_filter(
+    include_types: list[str] | tuple[str, ...] | frozenset[str] | None,
+    exclude_types: list[str] | tuple[str, ...] | frozenset[str] | None,
+):
+    """Return a predicate ``display_path -> bool`` matching the CLI diff
+    scope rules: metadata folder (first path segment) names,
+    case-insensitive; include list applied first, then exclude; exclusion
+    wins."""
+    inc = {str(t).strip().lower() for t in (include_types or []) if str(t).strip()}
+    exc = {str(t).strip().lower() for t in (exclude_types or []) if str(t).strip()}
+
+    def keep(display: str) -> bool:
+        top = display.replace("\\", "/").split("/")[0].lower()
+        if inc and top not in inc:
+            return False
+        return top not in exc
+
+    return keep
+
+
+def apply_type_scope(
+    result: TreeCompareResult,
+    include_types: list[str] | tuple[str, ...] | frozenset[str] | None,
+    exclude_types: list[str] | tuple[str, ...] | frozenset[str] | None,
+) -> TreeCompareResult:
+    """Scope a comparison to include/exclude metadata type folders.
+
+    The full file indexes are preserved — companions, whole components and
+    destructive-overlap checks still need whole-tree context — while the
+    drift lists are filtered so out-of-scope paths never surface in
+    counts, selection or exports.
+    """
+    if not include_types and not exclude_types:
+        return result
+    keep = type_scope_filter(include_types, exclude_types)
+    # In-scope metrics, computed against the full indexes: common keys are
+    # partitioned into identical (exact + normalized) and differ, so the
+    # scoped identical count is the scoped common minus the scoped differs —
+    # normalized-identical pairs count as identical, matching identical_count.
+    common = result.left_ix.keys() & result.right_ix.keys()
+    scoped_common = sum(1 for k in common if keep(result.left_ix[k][1]))
+    scoped_identical = scoped_common - sum(
+        1 for p in result.differ_pairs if keep(p[2])
+    )
+    return TreeCompareResult(
+        left_ix=result.left_ix,
+        right_ix=result.right_ix,
+        only_left_keys=tuple(
+            k for k in result.only_left_keys if keep(result.left_ix[k][1])
+        ),
+        only_right_keys=tuple(
+            k for k in result.only_right_keys if keep(result.right_ix[k][1])
+        ),
+        identical_count=result.identical_count,
+        differ_pairs=tuple(p for p in result.differ_pairs if keep(p[2])),
+        identical_normalized_pairs=tuple(
+            p for p in result.identical_normalized_pairs if keep(p[2])
+        ),
+        left_root=result.left_root,
+        right_root=result.right_root,
+        scoped_identical_count=scoped_identical,
+        scoped_total_left=sum(
+            1 for _, d in result.left_ix.values() if keep(d)
+        ),
+        scoped_total_right=sum(
+            1 for _, d in result.right_ix.values() if keep(d)
+        ),
     )

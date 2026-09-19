@@ -34,7 +34,15 @@ if str(_SCRIPT_DIR) not in sys.path:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from mct.retrieved_folder_compare import compare_trees, TreeCompareResult
+from mct.retrieved_folder_compare import (
+    LinkedMetadataError,
+    TreeCompareResult,
+    apply_type_scope,
+    check_metadata_read,
+    compare_trees,
+    norm_key,
+    read_metadata_bytes,
+)
 from mct.xml_normalizer import _MAX_XML_BYTES
 from mct.ui_server_base import BaseUIHandler, serve_ui
 
@@ -49,6 +57,16 @@ BASELINE_FILE: Path | None = None
 # Comparison-pair scope for acceptances (branch:main↔org:prod style);
 # None when either side lacks provenance — acceptances are then global.
 PAIR_KEY: str | None = None
+# Metadata-type scope (--include-type / --exclude-type, repeatable, from the
+# orchestrator form or env-compare ui). None/empty = unscoped comparison.
+INCLUDE_TYPES: frozenset[str] | None = None
+EXCLUDE_TYPES: frozenset[str] | None = None
+
+
+def _scope_key() -> tuple[frozenset[str], frozenset[str]]:
+    """Effective (include, exclude) type scope — part of the comparison
+    cache key so a scope change can never reuse another scope's result."""
+    return (frozenset(INCLUDE_TYPES or ()), frozenset(EXCLUDE_TYPES or ()))
 
 
 def active_baseline() -> dict:
@@ -63,13 +81,40 @@ def active_baseline() -> dict:
 # ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=8)
-def get_comparison(left: Path, right: Path) -> TreeCompareResult:
+def _cached_comparison(
+    left: Path,
+    right: Path,
+    scope_key: tuple[frozenset[str], frozenset[str]],
+) -> TreeCompareResult:
     # XML element ignore rules affect the compare itself; they are read once
     # per (left, right) thanks to the cache — edit rules, restart the server.
+    # The type scope is part of the cache key: results can never leak
+    # between filter configurations.
     bl = active_baseline()
     ignore = _baseline.xml_ignore_elements(bl) or None
-    return compare_trees(left, right, ignore, _baseline.strip_retrieve_defaults(bl),
-                         xml_ignore_by_type=_baseline.xml_ignore_by_type(bl) or None)
+    result = compare_trees(left, right, ignore, _baseline.strip_retrieve_defaults(bl),
+                           xml_ignore_by_type=_baseline.xml_ignore_by_type(bl) or None)
+    return apply_type_scope(result, scope_key[0], scope_key[1])
+
+
+def get_comparison(
+    left: Path,
+    right: Path,
+    scope_key: tuple[frozenset[str], frozenset[str]] | None = None,
+) -> TreeCompareResult:
+    """Comparison for (left, right) under the current module type scope.
+
+    Thin uncached wrapper over the lru_cached worker: the LIVE scope is
+    folded into the lookup key at call time, so a scope change can never
+    return a previously cached result. Passing an explicit *scope_key*
+    bypasses the module globals (tests)."""
+    return _cached_comparison(
+        left, right, _scope_key() if scope_key is None else scope_key
+    )
+
+
+# Tests/ops clear the comparison cache through the public name.
+get_comparison.cache_clear = _cached_comparison.cache_clear  # type: ignore[attr-defined]
 
 
 def repo_relative(p: Path) -> str:
@@ -80,6 +125,10 @@ def repo_relative(p: Path) -> str:
 
 
 def is_binary(path: Path) -> bool:
+    if path.is_symlink():
+        # Links are never read — treat as non-text so no caller proceeds
+        # to a text read through them.
+        return True
     try:
         chunk = path.read_bytes()[:8192]
     except OSError:
@@ -87,8 +136,31 @@ def is_binary(path: Path) -> bool:
     return b"\x00" in chunk
 
 
-def file_diff(left_path: Path, right_path: Path, ignore_ws: bool = False, ignore_case: bool = False) -> dict:
-    """Generate unified diff data for a single file pair."""
+def file_diff(left_path: Path, right_path: Path, ignore_ws: bool = False, ignore_case: bool = False,
+              *, left_root: Path | None = None, right_root: Path | None = None) -> dict:
+    """Generate unified diff data for a single file pair.
+
+    With *left_root*/*right_root* the full metadata-read policy applies:
+    no symlink may appear on ANY component beneath the trusted comparison
+    root and containment is verified before a byte is read — a cached
+    index path whose ancestor was swapped for a link after the compare
+    cannot leak external content into the diff."""
+    def _linked_error() -> dict:
+        return {
+            "error": "Symbolic links are never read as metadata "
+                     "(a link can point outside the compared tree)",
+            "diff": "",
+        }
+
+    try:
+        if left_root is not None:
+            left_path = check_metadata_read(left_root, left_path)
+        if right_root is not None:
+            right_path = check_metadata_read(right_root, right_path)
+    except LinkedMetadataError:
+        return _linked_error()
+    if left_path.is_symlink() or right_path.is_symlink():
+        return _linked_error()
     if not left_path.is_file() or not right_path.is_file():
         return {"error": "File missing on one side", "diff": ""}
 
@@ -160,7 +232,10 @@ def build_summary(left_root: Path, right_root: Path, left_rel: str, right_rel: s
     accepted: list[dict] = []
 
     def _classify(disp: str, lp: Path | None, rp: Path | None, raw_status: str):
-        status, detail = _baseline.classify_entry(disp, lp, rp, baseline, pair_key=PAIR_KEY)
+        status, detail = _baseline.classify_entry(
+            disp, lp, rp, baseline, pair_key=PAIR_KEY,
+            left_root=left_root, right_root=right_root,
+        )
         base = {"path": disp, "type": metadata_type(disp), "side_status": raw_status}
         if status == "ignored":
             ignored.append({**base, "status": "ignored", "rule": detail or ""})
@@ -206,13 +281,27 @@ def build_summary(left_root: Path, right_root: Path, left_rel: str, right_rel: s
         }
         if status == "accepted_stale":
             entry["accepted_stale"] = True
+        # Binary bodies have no text diff to render — flag them so reports
+        # and the detail pane can explain instead of showing nothing.
+        try:
+            lp_safe: Path | None = check_metadata_read(left_root, lp)
+            rp_safe: Path | None = check_metadata_read(right_root, rp)
+        except LinkedMetadataError:
+            lp_safe = rp_safe = None
+        try:
+            if (lp_safe is not None and rp_safe is not None
+                    and lp_safe.is_file() and rp_safe.is_file()
+                    and (is_binary(lp_safe) or is_binary(rp_safe))):
+                entry["binary"] = True
+        except OSError:
+            pass
         # XML files over the normalizer's size cap were compared byte-for-byte
         # only — formatting noise was NOT filtered, so this "different" verdict
         # is lower-confidence than the rest. Surface that instead of hiding it.
-        if ld.lower().endswith(".xml"):
+        if ld.lower().endswith(".xml") and lp_safe is not None and rp_safe is not None:
             try:
-                if (lp.stat().st_size > _MAX_XML_BYTES
-                        or rp.stat().st_size > _MAX_XML_BYTES):
+                if (lp_safe.stat().st_size > _MAX_XML_BYTES
+                        or rp_safe.stat().st_size > _MAX_XML_BYTES):
                     entry["normalization_skipped"] = True
             except OSError:
                 pass
@@ -246,9 +335,19 @@ def build_summary(left_root: Path, right_root: Path, left_rel: str, right_rel: s
     return {
         "left": left_rel,
         "right": right_rel,
-        "total_left": len(cmp.left_ix),
-        "total_right": len(cmp.right_ix),
-        "identical_count": cmp.identical_count,
+        # Scoped view: totals/identical reconcile with the advertised
+        # include/exclude scope (out-of-scope files are not counted).
+        "total_left": cmp.visible_total_left,
+        "total_right": cmp.visible_total_right,
+        "identical_count": cmp.visible_identical_count,
+        # Whole-tree context kept separate — the indexes stay complete for
+        # component expansion; these raw numbers are context, not the
+        # denominator for scoped drift metrics.
+        "whole_tree": {
+            "total_left": len(cmp.left_ix),
+            "total_right": len(cmp.right_ix),
+            "identical_count": cmp.identical_count,
+        },
         "identical_normalized_count": len(cmp.identical_normalized_pairs),
         "different_count": len(differ),
         "only_left_count": len(only_left),
@@ -263,6 +362,10 @@ def build_summary(left_root: Path, right_root: Path, left_rel: str, right_rel: s
         "accepted": sorted(accepted, key=lambda x: x["path"].lower()),
         "baseline_enabled": BASELINE_FILE is not None,
         "type_counts": dict(sorted(type_counts.items(), key=lambda x: x[0].lower())),
+        "scope": {
+            "include_types": sorted(INCLUDE_TYPES or ()),
+            "exclude_types": sorted(EXCLUDE_TYPES or ()),
+        },
     }
 
 
@@ -274,12 +377,32 @@ def _embed_safe(text: str, tag: str) -> str:
     return text.replace(f"</{tag}", f"<\\/{tag}").replace("<!--", "<\\!--")
 
 
+def _file_meta(p: Path, root: Path) -> str:
+    """Human-readable size+hash summary for report entries (binary changes).
+    Reads through the trusted-root policy — linked paths are never hashed."""
+    import hashlib
+
+    try:
+        data = read_metadata_bytes(root, p)
+    except (OSError, LinkedMetadataError):
+        return "unreadable"
+    return f"{len(data)} bytes · sha256 {hashlib.sha256(data).hexdigest()[:12]}"
+
+
 def _build_standalone_report(handler) -> str:
     """Complete offline HTML report: vendored diff2html assets inlined, diff
-    content embedded, and active/accepted/ignored status lists. No CDN, no
-    server, no token — everything needed renders from this one file."""
+    content embedded, retrieval-completeness warnings, and
+    active/accepted/ignored status lists. No CDN, no server, no token —
+    everything needed renders from this one file.
+
+    Every active changed file gets an entry — a binary body, a vanished or
+    linked file, or a render failure all produce an explanatory section so
+    a changed count can never contradict an empty file list.
+    """
     import html as _esc
     from urllib.parse import quote
+
+    from mct.comparison import _provenance_warnings
 
     cmp = get_comparison(handler.left_root, handler.right_root)
     summary = build_summary(
@@ -291,14 +414,55 @@ def _build_standalone_report(handler) -> str:
     # active drift — accepted/ignored entries appear in their own sections,
     # never as unlabeled active diffs contradicting the counts.
     active_paths = {d["path"] for d in summary["differ"]}
-    diffs: list[tuple[str, str, bool]] = []
+    # One entry per active changed file: either renderable text or an
+    # explicit explanation. (path, kind, diff_text, notice, is_stale)
+    entries: list[dict[str, Any]] = []
     for lp, rp, ld, _ in cmp.differ_pairs:
         if ld not in active_paths:
             continue
-        result = file_diff(lp, rp)
-        if result.get("error") or not result.get("diff"):
-            continue
-        diffs.append((ld, result["diff"], ld in stale))
+        entry: dict[str, Any] = {
+            "path": ld, "stale": ld in stale, "diff": None,
+            "kind": "diff", "notice": "", "meta": "",
+        }
+        try:
+            lp_safe: Path | None = check_metadata_read(handler.left_root, lp)
+            rp_safe: Path | None = check_metadata_read(handler.right_root, rp)
+        except LinkedMetadataError:
+            lp_safe = rp_safe = None
+        if lp_safe is None or rp_safe is None:
+            entry.update(
+                kind="linked",
+                notice="Symbolic link — link content is never read or rendered",
+            )
+        elif not lp_safe.is_file() or not rp_safe.is_file():
+            entry.update(
+                kind="missing",
+                notice="File missing or unreadable on one side",
+            )
+        elif is_binary(lp_safe) or is_binary(rp_safe):
+            entry.update(
+                kind="binary",
+                notice="Binary content changed — no text diff available",
+                meta=(
+                    f"left: {_file_meta(lp_safe, handler.left_root)} · "
+                    f"right: {_file_meta(rp_safe, handler.right_root)}"
+                ),
+            )
+        else:
+            result = file_diff(
+                lp_safe, rp_safe,
+                left_root=handler.left_root, right_root=handler.right_root,
+            )
+            if result.get("error"):
+                entry.update(
+                    kind="error",
+                    notice=f"Text diff unavailable: {result['error']}",
+                )
+            elif not result.get("diff"):
+                entry.update(kind="empty", notice="No textual diff available")
+            else:
+                entry["diff"] = result["diff"]
+        entries.append(entry)
 
     css = _embed_safe(
         (UI_DIR / "kit" / "vendor" / "diff2html.min.css").read_text(encoding="utf-8"),
@@ -327,18 +491,67 @@ def _build_standalone_report(handler) -> str:
         )
         return f"<ul>{rows}</ul>"
 
+    kind_labels = {
+        "binary": "binary",
+        "linked": "symbolic link",
+        "missing": "unavailable",
+        "error": "diff unavailable",
+        "empty": "no text diff",
+    }
     sections: list[str] = []
-    for disp, diff_text, is_stale in diffs:
+    for e in entries:
         badge = (
             ' <span class="badge stale">accepted — stale (changed since acceptance)</span>'
-            if is_stale
+            if e["stale"]
             else ""
         )
-        sections.append(
-            f'<section class="file"><h3><code>{esc(disp)}</code>{badge}</h3>'
-            f'<div class="d2h" data-diff="{quote(diff_text, safe="")}"></div></section>'
-        )
+        if e["diff"] is not None:
+            sections.append(
+                f'<section class="file"><h3><code>{esc(e["path"])}</code>{badge}</h3>'
+                f'<div class="d2h" data-diff="{quote(e["diff"], safe="")}"></div></section>'
+            )
+        else:
+            label = kind_labels.get(e["kind"], e["kind"])
+            meta = f'<br><span class="muted">{esc(e["meta"])}</span>' if e["meta"] else ""
+            sections.append(
+                f'<section class="file"><h3><code>{esc(e["path"])}</code>{badge}'
+                f' <span class="badge {esc(e["kind"])}">{esc(label)}</span></h3>'
+                f'<p class="muted">{esc(e["notice"])}{meta}</p></section>'
+            )
     changed_html = "\n".join(sections) or '<p class="muted">(no changed files)</p>'
+
+    # Retrieval completeness: provenance warnings (skipped types, retrieve
+    # warnings, API-version mismatch) plus the recorded per-component
+    # retrieve problems — an incomplete snapshot must never read as a clean
+    # comparison. Warning text is untrusted — escaped like everything else.
+    left_info = getattr(handler, "left_info", None)
+    right_info = getattr(handler, "right_info", None)
+    prov_warns = _provenance_warnings(left_info, right_info)
+    warning_rows = "".join(f"<li>{esc(w)}</li>" for w in prov_warns)
+    for side_label, info in (("Left", left_info), ("Right", right_info)):
+        for w in (info or {}).get("retrieve_warnings") or []:
+            warning_rows += f"<li>{side_label} retrieve warning: {esc(w)}</li>"
+    warnings_html = (
+        f'<h2>Snapshot completeness warnings</h2>\n<ul class="warnings">{warning_rows}</ul>'
+        if warning_rows
+        else ""
+    )
+
+    # The comparison may be scoped to a subset of metadata types — the
+    # report must say so or a filtered result reads as a complete compare.
+    scope = summary["scope"]
+    scope_note = ""
+    if scope["include_types"]:
+        scope_note += (
+            f'<p class="muted">Scoped to metadata type(s): '
+            f'<b>{esc(", ".join(scope["include_types"]))}</b> — '
+            "other types are not shown in this report.</p>"
+        )
+    if scope["exclude_types"]:
+        scope_note += (
+            f'<p class="muted">Excluded metadata type(s): '
+            f'<b>{esc(", ".join(scope["exclude_types"]))}</b>.</p>'
+        )
 
     title = f"metadata-compare: {handler.left_rel} vs {handler.right_rel}"
     stats = (
@@ -364,12 +577,16 @@ h2 {{ font-size: 15px; margin-top: 28px; border-bottom: 1px solid #ddd; padding-
 .stats {{ color: #555; margin-bottom: 16px; }}
 .muted {{ color: #888; }}
 .badge {{ font-size: 11px; border: 1px solid #b58105; color: #8a6104; border-radius: 10px; padding: 1px 8px; }}
+.badge.binary, .badge.linked {{ border-color: #8250df; color: #8250df; }}
+.warnings li {{ color: #8a6104; }}
 .file {{ margin-top: 18px; }}
 ul {{ line-height: 1.7; }}
 </style>
 </head><body>
 <h1>{esc(title)}</h1>
 <div class="stats">{esc(stats)}</div>
+{scope_note}
+{warnings_html}
 <p class="muted">Self-contained report generated by metadata-compare-tool —
 all renderer assets and diff content are inlined; works fully offline.</p>
 
@@ -469,8 +686,11 @@ class DiffUIHandler(BaseUIHandler):
         if not disp:
             self._serve_json({"ok": False, "error": "Missing 'path'"}, status=400)
             return
-        from mct.retrieved_folder_compare import norm_key
-        cmp = get_comparison(self.left_root, self.right_root)
+        try:
+            cmp = get_comparison(self.left_root, self.right_root)
+        except Exception as exc:
+            self._serve_json({"ok": False, "error": f"Comparison failed: {exc}"}, status=500)
+            return
         key = norm_key(Path(disp))
         lp = cmp.left_ix[key][0] if key in cmp.left_ix else None
         rp = cmp.right_ix[key][0] if key in cmp.right_ix else None
@@ -478,10 +698,15 @@ class DiffUIHandler(BaseUIHandler):
             self._serve_json({"ok": False, "error": f"File not found: {disp}"}, status=404)
             return
         if accept:
-            entry = _baseline.accept_diff(
-                disp, lp, rp, note=(body.get("note") or ""), baseline_file=BASELINE_FILE,
-                pair_key=PAIR_KEY,
-            )
+            try:
+                entry = _baseline.accept_diff(
+                    disp, lp, rp, note=(body.get("note") or ""), baseline_file=BASELINE_FILE,
+                    pair_key=PAIR_KEY,
+                    left_root=self.left_root, right_root=self.right_root,
+                )
+            except _baseline.FingerprintReadError as exc:
+                self._serve_json({"ok": False, "error": str(exc)}, status=409)
+                return
             self._serve_json({"ok": True, "accepted_at": entry["accepted_at"]})
         else:
             removed = _baseline.unaccept_diff(disp, baseline_file=BASELINE_FILE)
@@ -494,8 +719,13 @@ class DiffUIHandler(BaseUIHandler):
         def _slug(s: str) -> str:
             return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_") or "tree"
 
+        try:
+            html = _build_standalone_report(self)
+        except Exception as exc:
+            self._serve_json({"error": f"Report failed: {exc}"}, status=500)
+            return
         self._serve_json({
-            "html": _build_standalone_report(self),
+            "html": html,
             "filename": (
                 f"metadata-compare-{_slug(self.left_rel)}-vs-{_slug(self.right_rel)}.html"
             ),
@@ -520,6 +750,16 @@ class DiffUIHandler(BaseUIHandler):
         deploy_files, destroy_files = _delta.collect_deploy_files(
             cmp, active_baseline(), pair_key=PAIR_KEY
         )
+        # Everything downstream — sf manifest resolution, the zip bundle,
+        # context expansion — reads through these paths. A cached index
+        # path whose ancestor was swapped for a link since the compare
+        # could expose out-of-tree files, so each path is re-verified
+        # against its trusted root right now (fail closed on ANY link
+        # component beneath the root, not just the leaf).
+        for abs_path, _disp in deploy_files:
+            check_metadata_read(self.left_root, abs_path)
+        for abs_path, _disp in destroy_files:
+            check_metadata_read(self.right_root, abs_path)
         if selected_paths is not None:
             sel = set(selected_paths)
             deploy_files = [e for e in deploy_files if e[1] in sel]
@@ -552,7 +792,17 @@ class DiffUIHandler(BaseUIHandler):
             destroy_members_res, destroy_err = self._resolve_components_via_sf(
                 [p for p, _ in destroy_files]
             )
-            context_dirs = self._left_context_dirs([d for _, d in destroy_files])
+            try:
+                context_dirs = self._left_context_dirs([d for _, d in destroy_files])
+            except LinkedMetadataError as exc:
+                return {
+                    "error": (
+                        f"{exc} — a context directory traverses a symbolic "
+                        "link whose contents could escape the compared "
+                        "tree; refusing export."
+                    ),
+                    "status": 409,
+                }
             context_members, context_err = self._resolve_components_via_sf(context_dirs)
             problems = [
                 e for e in (deploy_err, destroy_err, context_err) if e
@@ -613,6 +863,17 @@ class DiffUIHandler(BaseUIHandler):
                     } & moved_set
                     if hits:
                         for f in sorted(d.rglob("*")):
+                            try:
+                                check_metadata_read(self.left_root, f)
+                            except LinkedMetadataError:
+                                return {
+                                    "error": (
+                                        f"Context component {d.name} contains a "
+                                        f"symbolic link ({f.name}); links are "
+                                        "never exported — refusing export."
+                                    ),
+                                    "status": 409,
+                                }
                             if f.is_file():
                                 context_deploy_files.append(
                                     (f, f.relative_to(self.left_root).as_posix())
@@ -653,6 +914,9 @@ class DiffUIHandler(BaseUIHandler):
         except ValueError as e:
             self._serve_json({"error": str(e)}, status=400)
             return
+        except Exception as exc:
+            self._serve_json({"error": f"Comparison failed: {exc}"}, status=500)
+            return
         manifests = self._build_delta_manifests(deploy_files, destroy_files)
         manifests.pop("context_deploy_files", None)
         status = manifests.pop("status", 200)
@@ -678,6 +942,9 @@ class DiffUIHandler(BaseUIHandler):
             deploy_files, destroy_files = self._collect_delta_files(body.get("selected_paths"))
         except ValueError as e:
             self._serve_json({"error": str(e)}, status=400)
+            return
+        except Exception as exc:
+            self._serve_json({"error": f"Comparison failed: {exc}"}, status=500)
             return
         manifests = self._build_delta_manifests(deploy_files, destroy_files)
         context_files = manifests.pop("context_deploy_files", [])
@@ -730,6 +997,7 @@ class DiffUIHandler(BaseUIHandler):
 
         buf = io.BytesIO()
         missing: list[str] = []
+        linked: list[str] = []
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             if manifests.get("package_xml"):
                 zf.writestr("package.xml", manifests["package_xml"])
@@ -737,7 +1005,15 @@ class DiffUIHandler(BaseUIHandler):
                 zf.writestr("destructiveChanges.xml", manifests["destructive_changes_xml"])
             for abs_path, disp in sorted(source_entries, key=lambda x: x[1].lower()):
                 try:
-                    zf.writestr(f"delta-source/{disp}", _file_bytes(abs_path, disp))
+                    safe_path = check_metadata_read(self.left_root, abs_path)
+                except LinkedMetadataError:
+                    # A path whose ancestor was swapped for a link after
+                    # indexing could smuggle an out-of-tree file into the
+                    # bundle — never read it.
+                    linked.append(disp)
+                    continue
+                try:
+                    zf.writestr(f"delta-source/{disp}", _file_bytes(safe_path, disp))
                 except OSError:
                     missing.append(disp)
             if stripped:
@@ -748,6 +1024,21 @@ class DiffUIHandler(BaseUIHandler):
                     + "".join(f"- {s}\n" for s in stripped)
                 )
             zf.writestr("README.md", readme)
+
+        if linked:
+            # A link in an exported bundle could leak an out-of-tree file —
+            # fail the whole export rather than ship a partial one.
+            self._serve_json(
+                {
+                    "error": (
+                        f"{len(linked)} source file(s) are symbolic links — "
+                        "links are never exported: "
+                        + ", ".join(linked[:10])
+                    )
+                },
+                status=409,
+            )
+            return
 
         if missing:
             # A manifest that names content the ZIP lacks is worse than no
@@ -778,11 +1069,17 @@ class DiffUIHandler(BaseUIHandler):
 
         A component's files are always colocated in one directory, so resolving
         these dirs tells us which destroy-side components also exist in source.
-        """
+
+        Candidates are verified against the trusted left root BEFORE any
+        resolution — resolving first and testing is_symlink() on the result
+        would erase the evidence of a linked ancestor."""
         dirs: dict[Path, None] = {}
         for disp in destroy_display_paths:
             parent = Path(disp).parent
-            candidate = (self.left_root / parent).resolve() if str(parent) != "." else self.left_root
+            candidate = (
+                self.left_root / parent if str(parent) != "." else self.left_root
+            )
+            candidate = check_metadata_read(self.left_root, candidate)
             if candidate.is_dir():
                 dirs[candidate] = None
         return list(dirs)
@@ -943,8 +1240,19 @@ class DiffUIHandler(BaseUIHandler):
         elif path.startswith("/kit/"):
             self._serve_kit_file(path)
         elif path == "/api/summary":
-            data = build_summary(
-                self.left_root, self.right_root, self.left_rel, self.right_rel
+            try:
+                data = build_summary(
+                    self.left_root, self.right_root, self.left_rel, self.right_rel
+                )
+            except Exception as exc:
+                # Unsafe trees (e.g. a symbolic link under the compare root)
+                # must fail closed with a readable error, not a dropped
+                # connection or a partial summary.
+                self._serve_json({"error": f"Comparison failed: {exc}"}, status=500)
+                return
+            from mct.comparison import _provenance_warnings
+            data["provenance_warnings"] = _provenance_warnings(
+                self.left_info, self.right_info
             )
             data["left_info"] = self.left_info
             data["right_info"] = self.right_info
@@ -957,14 +1265,20 @@ class DiffUIHandler(BaseUIHandler):
             if not file_path:
                 self._serve_json({"error": "Missing ?path= parameter"}, status=400)
                 return
-            cmp = get_comparison(self.left_root, self.right_root)
+            try:
+                cmp = get_comparison(self.left_root, self.right_root)
+            except Exception as exc:
+                self._serve_json({"error": f"Comparison failed: {exc}"}, status=500)
+                return
             # Find the file pair
-            from mct.retrieved_folder_compare import norm_key
             key = norm_key(Path(file_path))
             if key in cmp.left_ix and key in cmp.right_ix:
                 lp, _ = cmp.left_ix[key]
                 rp, _ = cmp.right_ix[key]
-                result = file_diff(lp, rp, ignore_ws=ignore_ws, ignore_case=ignore_case)
+                result = file_diff(
+                    lp, rp, ignore_ws=ignore_ws, ignore_case=ignore_case,
+                    left_root=self.left_root, right_root=self.right_root,
+                )
                 self._serve_json(result)
             else:
                 # It's an only-left or only-right file, show full content
@@ -981,6 +1295,16 @@ class DiffUIHandler(BaseUIHandler):
 
     def _serve_file_content(self, filepath: Path, side: str):
         """Serve content of a file that only exists on one side."""
+        root = self.left_root if side == "left" else self.right_root
+        try:
+            filepath = check_metadata_read(root, filepath)
+        except LinkedMetadataError:
+            self._serve_json({
+                "error": "Symbolic links are never read as metadata "
+                         "(a link can point outside the compared tree)",
+                "diff": "", "side": side,
+            })
+            return
         if is_binary(filepath):
             self._serve_json({"error": "Binary file", "diff": "", "side": side})
             return
@@ -1053,6 +1377,12 @@ def parse_args() -> argparse.Namespace:
                    help="Project baseline.json (ignore rules + accepted diffs). "
                         "Enables the Accept-diff feature. XML element rules are read "
                         "once per compare — restart after editing them.")
+    p.add_argument("--include-type", action="append", default=[], metavar="TYPE",
+                   help="Limit the comparison to this metadata type folder "
+                        "(repeatable, case-insensitive).")
+    p.add_argument("--exclude-type", action="append", default=[], metavar="TYPE",
+                   help="Exclude this metadata type folder from the comparison "
+                        "(repeatable; exclusion wins over includes).")
     return p.parse_args()
 
 
@@ -1086,6 +1416,14 @@ def main() -> int:
     right_info = _parse_info(args.right_info)
     global PAIR_KEY
     PAIR_KEY = _baseline.pair_key_for(left_info, right_info)
+
+    global INCLUDE_TYPES, EXCLUDE_TYPES
+    INCLUDE_TYPES = frozenset(
+        str(t).strip().lower() for t in (args.include_type or []) if str(t).strip()
+    ) or None
+    EXCLUDE_TYPES = frozenset(
+        str(t).strip().lower() for t in (args.exclude_type or []) if str(t).strip()
+    ) or None
 
     handler_cls = make_handler(
         left_root, right_root, left_rel, right_rel, args.api_version,

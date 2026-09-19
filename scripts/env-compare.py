@@ -343,7 +343,9 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Validate (check-only, --dry-run) that the left→right delta would deploy "
             "cleanly to an org. NOTHING is saved to the org. Supports Copado-style "
-            "clean-and-retry and no-grant permission stripping."
+            "clean-and-retry and no-grant permission stripping. Deltas containing "
+            "target-only deletions are outside validation scope — they are reported "
+            "and refused, never treated as successfully validated."
         ),
     )
     sp_val.add_argument("--left", required=True, metavar="PATH|SNAP_ID",
@@ -384,6 +386,12 @@ def parse_args() -> argparse.Namespace:
     sp_ui.add_argument("--right", required=True, help="Snapshot id or repo-relative path.")
     sp_ui.add_argument("--port", type=int, default=8089)
     sp_ui.add_argument("--no-open", action="store_true")
+    sp_ui.add_argument("--include-type", action="append", default=[], metavar="TYPE",
+                       help="Limit the comparison to this metadata type folder "
+                            "(repeatable, case-insensitive).")
+    sp_ui.add_argument("--exclude-type", action="append", default=[], metavar="TYPE",
+                       help="Exclude this metadata type folder from the comparison "
+                            "(repeatable; exclusion wins over includes).")
     sp_ui.set_defaults(_fn="ui")
 
     sp_snap_pkg = sub.add_parser(
@@ -645,7 +653,11 @@ def main() -> int:
                 print(f"  \u26a0 Package snapshot skipped: {exc}", flush=True)
             return 0
         if args._fn == "ui":
-            return run_ui(args.left, args.right, args.port, args.no_open, api_ver)
+            return run_ui(
+                args.left, args.right, args.port, args.no_open, api_ver,
+                include_types=args.include_type or [],
+                exclude_types=args.exclude_type or [],
+            )
         if args._fn == "snapshot_packages":
             snap = snapshot_installed_packages(args.org)
             print(json.dumps({"snapshot_id": snap.snapshot_id, "status": "success"}), flush=True)

@@ -44,8 +44,14 @@ def _classify_result(
     accepted_files: list[dict[str, str]] = []
     accepted_stale_files: list[str] = []
 
+    lroot = getattr(result, "left_root", None)
+    rroot = getattr(result, "right_root", None)
+
     for lp, rp, ld, _ in result.differ_pairs:
-        status, detail = _bl.classify_entry(ld, lp, rp, baseline, pair_key=pair_key)
+        status, detail = _bl.classify_entry(
+            ld, lp, rp, baseline, pair_key=pair_key,
+            left_root=lroot, right_root=rroot,
+        )
         if status == "ignored":
             ignored_files.append({"path": ld, "rule": detail or ""})
         elif status == "accepted":
@@ -57,7 +63,10 @@ def _classify_result(
 
     for k in result.only_left_keys:
         lp, disp = result.left_ix[k]
-        status, detail = _bl.classify_entry(disp, lp, None, baseline, pair_key=pair_key)
+        status, detail = _bl.classify_entry(
+            disp, lp, None, baseline, pair_key=pair_key,
+            left_root=lroot, right_root=rroot,
+        )
         if status == "ignored":
             ignored_files.append({"path": disp, "rule": detail or ""})
         elif status == "accepted":
@@ -69,7 +78,10 @@ def _classify_result(
 
     for k in result.only_right_keys:
         rp, disp = result.right_ix[k]
-        status, detail = _bl.classify_entry(disp, None, rp, baseline, pair_key=pair_key)
+        status, detail = _bl.classify_entry(
+            disp, None, rp, baseline, pair_key=pair_key,
+            left_root=lroot, right_root=rroot,
+        )
         if status == "ignored":
             ignored_files.append({"path": disp, "rule": detail or ""})
         elif status == "accepted":
@@ -102,7 +114,7 @@ def run_diff(
     use_baseline: bool = True,
     notify_webhook: str | None = None,
 ) -> int:
-    from mct.retrieved_folder_compare import compare_trees, TreeCompareResult
+    from mct.retrieved_folder_compare import apply_type_scope, compare_trees
 
     import mct.baseline as _bl
 
@@ -134,25 +146,7 @@ def run_diff(
         return display.split("/")[0].split("\\")[0].lower()
 
     if include_types or exclude_types:
-        inc = {t.lower() for t in (include_types or [])}
-        exc = {t.lower() for t in (exclude_types or [])}
-
-        def _keep(display: str) -> bool:
-            t = _type_of(display)
-            if inc and t not in inc:
-                return False
-            if t in exc:
-                return False
-            return True
-
-        result = TreeCompareResult(
-            identical_count=result.identical_count,
-            differ_pairs=tuple(p for p in result.differ_pairs if _keep(p[2])),
-            only_left_keys=tuple(k for k in result.only_left_keys if _keep(result.left_ix[k][1])),
-            only_right_keys=tuple(k for k in result.only_right_keys if _keep(result.right_ix[k][1])),
-            left_ix=result.left_ix,
-            right_ix=result.right_ix,
-        )
+        result = apply_type_scope(result, include_types, exclude_types)
 
     # Baseline classification: ignored/accepted drift is reported separately
     # and does not trip fail-on-diff; accepted-but-changed entries resurface.
@@ -174,7 +168,7 @@ def run_diff(
     different = len(different_files)
     only_left = len(only_left_files)
     only_right = len(only_right_files)
-    identical = result.identical_count
+    identical = result.visible_identical_count
     has_diff = (different + only_left + only_right) > 0
 
     # XML files above the normalization size cap were compared raw — their
@@ -214,7 +208,8 @@ def run_diff(
             "left": left_rel, "right": right_rel,
             "different_count": different, "only_left_count": only_left,
             "only_right_count": only_right, "identical_count": identical,
-            "total_left": len(result.left_ix), "total_right": len(result.right_ix),
+            "total_left": result.visible_total_left,
+            "total_right": result.visible_total_right,
             "has_diff": has_diff,
             "different_files": different_files,
             "only_left_files": only_left_files,
@@ -388,8 +383,20 @@ def _provenance_warnings(
     return warns
 
 
-def run_ui(left: str, right: str, port: int, no_open: bool, api_version: str | None = None) -> int:
-    from mct.retrieved_folder_compare import compare_trees
+def run_ui(
+    left: str,
+    right: str,
+    port: int,
+    no_open: bool,
+    api_version: str | None = None,
+    include_types: list[str] | None = None,
+    exclude_types: list[str] | None = None,
+) -> int:
+    from mct.retrieved_folder_compare import (
+        LinkedMetadataError,
+        apply_type_scope,
+        compare_trees,
+    )
 
     left_rel = resolve_snapshot_or_path(left)
     right_rel = resolve_snapshot_or_path(right)
@@ -398,7 +405,12 @@ def run_ui(left: str, right: str, port: int, no_open: bool, api_version: str | N
 
     try:
         _result = compare_trees(left_abs, right_abs)
+        if include_types or exclude_types:
+            _result = apply_type_scope(_result, include_types, exclude_types)
         _idx.record_comparison(left_rel, right_rel, _result)
+    except LinkedMetadataError:
+        # An unsafe tree must fail closed — never launch a UI over it.
+        raise
     except Exception as exc:
         print(f"  \u26a0 History record skipped: {exc}", flush=True)
 
@@ -414,6 +426,12 @@ def run_ui(left: str, right: str, port: int, no_open: bool, api_version: str | N
         "--api-version",
         api_version or _cfg.DEFAULT_API_VERSION,
     ]
+    for t in include_types or []:
+        if t and str(t).strip():
+            cmd += ["--include-type", str(t).strip()]
+    for t in exclude_types or []:
+        if t and str(t).strip():
+            cmd += ["--exclude-type", str(t).strip()]
     left_info = _snapshot_provenance(left)
     right_info = _snapshot_provenance(right)
     if left_info:
@@ -781,7 +799,7 @@ def run_compare_matrix(
                 "left": left_rel, "right": right_rel,
                 "different": different, "only_left": only_left,
                 "only_right": only_right,
-                "identical": result.identical_count,
+                "identical": result.visible_identical_count,
                 "has_diff": has_diff,
                 "error": None,
             })

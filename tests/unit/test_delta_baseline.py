@@ -334,7 +334,7 @@ class TestValidateDeployPairScope(unittest.TestCase):
             baseline_file=self.baseline_file,
             pair_key=PAIR,
         )
-        entries = _validate._collect_delta("snap-branch", "snap-org", True)
+        entries, _destroy = _validate._collect_delta("snap-branch", "snap-org", True)
         displays = sorted(d for _, d in entries)
         assert "classes/Changed.cls" not in displays
         assert "classes/LeftOnly.cls" in displays
@@ -349,5 +349,5 @@ class TestValidateDeployPairScope(unittest.TestCase):
             baseline_file=self.baseline_file,
             pair_key="branch:release↔org:uat",
         )
-        entries = _validate._collect_delta("snap-branch", "snap-org", True)
+        entries, _destroy = _validate._collect_delta("snap-branch", "snap-org", True)
         assert "classes/Changed.cls" in sorted(d for _, d in entries)

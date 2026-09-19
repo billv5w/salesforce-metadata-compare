@@ -225,7 +225,7 @@ class TestDeltaComponentBoundaries:
         current = baseline.load_baseline(baseline_file)
         monkeypatch.setattr(baseline, "load_baseline", lambda: current)
 
-        entries = validate._collect_delta(str(left), str(right), True)
+        entries, _destroy = validate._collect_delta(str(left), str(right), True)
         paths = {display for _, display in entries}
         assert selected in paths
         assert accepted not in paths

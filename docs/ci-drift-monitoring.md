@@ -55,10 +55,14 @@ baseline snapshot.
 
 ### Validate-deploy exit codes in CI
 
-`validate-deploy` distinguishes three outcomes: **0** valid as authored,
-**1** failed, **2** valid only after `--clean-retries` excluded components
-(NOT deployable as authored — read `excluded_files` in the report JSON).
-Treat 2 as a soft failure, not success.
+`validate-deploy` distinguishes these outcomes: **0** valid as authored
+(or no active drift), **1** failed — including a delta containing
+target-only deletions, which `--dry-run` validation cannot cover and is
+therefore refused before any deploy check runs (see
+`unvalidated_deletions` in the report JSON) — and **2** valid only after
+`--clean-retries` excluded components (NOT deployable as authored — read
+`excluded_files` in the report JSON). Treat 2 as a soft failure, not
+success.
 
 ## GitHub Actions (nightly)
 

@@ -30,7 +30,13 @@ import mct.config as _cfg
 
 
 def _collect_delta(left: str, right: str, use_baseline: bool):
-    """(expanded deploy files, compare result) for the left→right delta."""
+    """(expanded deploy files, destroy files) for the left→right delta.
+
+    Both sides are baseline-filtered active drift. *destroy files* are the
+    right-only entries — deletions the ``--dry-run`` validator cannot cover
+    (a validation deploy only exercises what package.xml deploys, never
+    destructiveChanges.xml). Callers must not discard them.
+    """
     import mct.baseline as _bl
     import mct.delta as _delta
     from mct.index import abs_snapshot_or_project_rel, resolve_snapshot_or_path
@@ -54,21 +60,29 @@ def _collect_delta(left: str, right: str, use_baseline: bool):
     pair_key = _bl.pair_key_for(
         _snapshot_provenance(left), _snapshot_provenance(right)
     )
-    deploy_files, _destroy = _delta.collect_deploy_files(
+    deploy_files, destroy_files = _delta.collect_deploy_files(
         result, baseline, pair_key=pair_key
     )
 
-    return _delta.expand_deployable_files(result.left_ix, deploy_files)
+    return _delta.expand_deployable_files(result.left_ix, deploy_files), destroy_files
 
 
 def _write_temp_project(
-    entries: list[tuple[Path, str]], api_version: str, strip_no_grant: bool
+    entries: list[tuple[Path, str]], api_version: str, strip_no_grant: bool,
+    trusted_root: Path | None = None,
 ) -> tuple[Path, list[str]]:
     """Materialize a throwaway SFDX project with the delta under force-app.
+
+    *trusted_root* is the comparison's resolved left root: when given, every
+    source path is verified against the full metadata-read policy (no link
+    on any component beneath the root, containment enforced) before a byte
+    is copied — a cached delta path whose ancestor became a link after
+    indexing cannot smuggle out-of-tree content into the validation deploy.
 
     Returns (project dir, list of no-grant entries stripped).
     """
     from mct.permissions import strip_no_grant_permissions
+    from mct.retrieved_folder_compare import check_metadata_read, read_metadata_bytes
 
     proj = Path(tempfile.mkdtemp(prefix="mct-validate-"))
     (proj / "sfdx-project.json").write_text(
@@ -82,9 +96,18 @@ def _write_temp_project(
     stripped: list[str] = []
     src_root = proj / "force-app" / "main" / "default"
     for abs_path, disp in entries:
+        if trusted_root is not None:
+            check_metadata_read(trusted_root, abs_path)
+            data = read_metadata_bytes(trusted_root, abs_path)
+        else:
+            if abs_path.is_symlink():
+                raise RuntimeError(
+                    f"Refusing to validate a delta containing a symbolic link "
+                    f"(links can expose files outside the compared tree): {disp}"
+                )
+            data = abs_path.read_bytes()
         target = src_root / disp
         target.parent.mkdir(parents=True, exist_ok=True)
-        data = abs_path.read_bytes()
         if strip_no_grant and disp.lower().endswith(".xml"):
             text, removed = strip_no_grant_permissions(
                 data.decode("utf-8", errors="replace")
@@ -177,13 +200,47 @@ def run_validate_deploy(
 ) -> int:
     from mct.safety import run as _run_safe
 
-    entries = _collect_delta(left, right, use_baseline)
-    if not entries:
+    entries, destroy_files = _collect_delta(left, right, use_baseline)
+    if not entries and not destroy_files:
         print("No active drift to validate — nothing to do.", flush=True)
         return 0
+    if destroy_files:
+        # Destructive changes are outside validate-deploy's supported scope:
+        # a dry-run only exercises what package.xml deploys — it can never
+        # validate deletions. Failing closed beats silently validating just
+        # the additions/changes of a deletion-bearing delta and reporting a
+        # misleading pass.
+        destroy_displays = sorted(d for _, d in destroy_files)
+        print(
+            f"✗ Cannot validate: {len(destroy_displays)} component file(s) exist only "
+            "in the target tree (deletions). validate-deploy covers deployable "
+            "additions/changes only — destructive changes are outside its "
+            "supported scope and were NOT validated.",
+            flush=True,
+        )
+        for d in destroy_displays:
+            print(f"    - {d}", flush=True)
+        report = {
+            "left": left, "right": right, "org": org_alias,
+            "created_at": _cfg.ts_local(),
+            "success": False,
+            "error": "unsupported_delta_scope",
+            "unvalidated_deletions": destroy_displays,
+            "deployable_files": len(entries),
+            "attempts": [],
+        }
+        _cfg.STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+        report_path = _cfg.STORAGE_ROOT / f"validation-report-{_cfg.ts_local()}.json"
+        report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(f"\n  Report: {report_path}", flush=True)
+        return 1
     print(f"  Delta: {len(entries)} deployable file(s)", flush=True)
 
-    proj, stripped = _write_temp_project(entries, api_version, strip_no_grant)
+    from mct.index import abs_snapshot_or_project_rel, resolve_snapshot_or_path
+    left_root = abs_snapshot_or_project_rel(resolve_snapshot_or_path(left))
+    proj, stripped = _write_temp_project(
+        entries, api_version, strip_no_grant, trusted_root=left_root
+    )
     if stripped:
         print(f"  Stripped {len(stripped)} no-grant permission entr"
               f"{'y' if len(stripped) == 1 else 'ies'} before validation.", flush=True)

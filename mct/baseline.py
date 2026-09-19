@@ -132,43 +132,108 @@ def ignore_reason(display_path: str, baseline: dict[str, Any]) -> str | None:
     return None
 
 
+class FingerprintReadError(RuntimeError):
+    """A file could not be read for fingerprinting.
+
+    An unreadable file is never treated as empty or as accepted content —
+    silently hashing "" would let a vanished file keep a stale acceptance.
+    """
+
+
+_FINGERPRINT_SCHEME = "v2"
+
+
 def compute_fingerprint(
     lp: Path | None,
     rp: Path | None,
     ignore: frozenset[str] | None = None,
     strip_defaults: bool = False,
+    *,
+    left_root: Path | None = None,
+    right_root: Path | None = None,
 ) -> str:
     """Content fingerprint of a differing file pair (either side may be absent
     for only-left/only-right entries).
 
-    Uses the same normalisation as the comparison itself, so formatting-only
-    churn does not invalidate an acceptance, while any semantic change on
-    either side does — including the missing side appearing.
+    Hash input is the file's raw bytes — never lossy decoded text — so
+    distinct binary contents can never collide (v1 decoded everything as
+    UTF-8-with-replacement, colliding e.g. ``00 82`` and ``00 83``). Text
+    canonicalisation is applied only where the comparison engine applies
+    the same equivalence rule:
+
+      - ``.xml``   → ``normalize_xml`` (as ``xml_semantically_equal``)
+      - ``.json``  → ``normalize_json`` (as ``json_semantically_equal``)
+      - text types → CRLF→LF + trailing-whitespace strip, on bytes exactly
+                     as ``text_equal_ignoring_line_endings``
+      - all others → raw bytes (the engine byte-compares them)
+
+    Existence and content boundaries are unambiguous: each side contributes
+    a ``missing``/``norm``/``raw`` tag plus an explicit length, so
+    missing-vs-empty, empty-vs-missing and swapped sides all differ.
+
+    Scheme version ``v2`` is embedded in both the digest preimage and the
+    returned string, so fingerprints stored by older versions can never
+    match — accepted entries become ``accepted_stale`` and resurface until
+    re-accepted, without corrupting the baseline (notes/ignore rules are
+    untouched).
+
+    A fingerprint is a read boundary: linked files are never hashed. A
+    direct link always fails; when *left_root*/*right_root* are given the
+    full trusted-root policy applies, so a link on ANY ancestor beneath
+    the comparison root is rejected as well.
     """
     from mct.json_normalizer import normalize_json
-    from mct.retrieved_folder_compare import _TEXT_SUFFIXES
+    from mct.retrieved_folder_compare import (
+        LinkedMetadataError,
+        _TEXT_SUFFIXES,
+        read_metadata_bytes,
+    )
     from mct.xml_normalizer import normalize_xml
 
-    def canon(p: Path | None) -> str:
+    def canon(p: Path | None, root: Path | None) -> tuple[bytes, bytes]:
+        """(tag, payload) for one side."""
         if p is None:
-            return ""
+            return b"missing", b""
         try:
-            text = p.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return ""
+            if p.is_symlink():
+                raise LinkedMetadataError(
+                    f"Cannot fingerprint a symbolic link: {p}"
+                )
+            data = (
+                read_metadata_bytes(root, p)
+                if root is not None
+                else p.read_bytes()
+            )
+        except (OSError, LinkedMetadataError) as exc:
+            raise FingerprintReadError(
+                f"Cannot fingerprint unreadable or unsafe file {p}: {exc}"
+            ) from exc
         suffix = p.suffix.lower()
         if suffix == ".xml":
-            return normalize_xml(text, ignore, strip_defaults)
+            return b"norm", normalize_xml(
+                data.decode("utf-8", errors="replace"), ignore, strip_defaults
+            ).encode("utf-8")
         if suffix == ".json":
-            return normalize_json(text)
+            return b"norm", normalize_json(
+                data.decode("utf-8", errors="replace")
+            ).encode("utf-8")
         if suffix in _TEXT_SUFFIXES:
-            # Same equivalence as text_equal_ignoring_line_endings, or
-            # accepted diffs go stale on CRLF/trailing-whitespace churn.
-            return text.replace("\r\n", "\n").rstrip("\r\n\t ")
-        return text.replace("\r\n", "\n").replace("\r", "\n")
+            # Same byte-level canon as text_equal_ignoring_line_endings.
+            return b"norm", data.replace(b"\r\n", b"\n").rstrip(b"\r\n\t ")
+        return b"raw", data
 
-    payload = canon(lp) + "\x00" + canon(rp)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    ltag, ldata = canon(lp, left_root)
+    rtag, rdata = canon(rp, right_root)
+    h = hashlib.sha256()
+    h.update(_FINGERPRINT_SCHEME.encode("ascii"))
+    for tag, payload in ((ltag, ldata), (rtag, rdata)):
+        h.update(b"\x00")
+        h.update(tag)
+        h.update(b"\x00")
+        h.update(str(len(payload)).encode("ascii"))
+        h.update(b"\x00")
+        h.update(payload)
+    return f"{_FINGERPRINT_SCHEME}:{h.hexdigest()}"
 
 
 def pair_key_for(
@@ -199,6 +264,9 @@ def accept_diff(
     note: str = "",
     baseline_file: Path | None = None,
     pair_key: str | None = None,
+    *,
+    left_root: Path | None = None,
+    right_root: Path | None = None,
 ) -> dict[str, Any]:
     """Record *display_path*'s current diff as accepted; returns the entry.
 
@@ -211,7 +279,8 @@ def accept_diff(
     data = load_baseline(target)
     entry = {
         "fingerprint": compute_fingerprint(
-            lp, rp, effective_xml_ignore(display_path, data), strip_retrieve_defaults(data)
+            lp, rp, effective_xml_ignore(display_path, data), strip_retrieve_defaults(data),
+            left_root=left_root, right_root=right_root,
         ),
         "accepted_at": _cfg.ts_local(),
         "note": note,
@@ -326,6 +395,9 @@ def classify_entry(
     rp: Path | None,
     baseline: dict[str, Any],
     pair_key: str | None = None,
+    *,
+    left_root: Path | None = None,
+    right_root: Path | None = None,
 ) -> tuple[str, str | None]:
     """Classify one drift entry (differ pair, or only-left/only-right with the
     missing side passed as None) against the baseline.
@@ -346,10 +418,16 @@ def classify_entry(
     if entry and entry.get("pair") is not None and entry.get("pair") != pair_key:
         entry = None  # accepted for a different comparison pair — not here
     if entry:
-        current = compute_fingerprint(
-            lp, rp, effective_xml_ignore(display_path, baseline),
-            strip_retrieve_defaults(baseline),
-        )
+        try:
+            current = compute_fingerprint(
+                lp, rp, effective_xml_ignore(display_path, baseline),
+                strip_retrieve_defaults(baseline),
+                left_root=left_root, right_root=right_root,
+            )
+        except FingerprintReadError:
+            # Unreadable side — the stored fingerprint cannot be verified,
+            # so the acceptance must not silently apply; resurface as stale.
+            return "accepted_stale", entry.get("accepted_at")
         if current == entry.get("fingerprint"):
             return "accepted", entry.get("accepted_at")
         return "accepted_stale", entry.get("accepted_at")
