@@ -1,6 +1,6 @@
 # Comparison workflows
 
-Use `--repo-root` to identify the Salesforce DX project whose Git branches and org snapshots you want to compare. Authenticate org aliases with the Salesforce CLI before running retrieval commands. All examples use placeholders rather than real org names.
+Run these commands from inside your Salesforce DX project, or pass `--repo-root /path/to/dx-project` (shown below) to point at one elsewhere. Authenticate org aliases with the Salesforce CLI before running retrieval commands. All examples use placeholders rather than real org names.
 
 ## Branch to org
 

@@ -15,24 +15,42 @@ CI targets macOS, Linux, and Windows. Local verification has been performed on m
 
 ## Install
 
-From a checkout of this repository:
+Clone this repository somewhere **outside** your Salesforce DX project, then install it with [pipx](https://pipx.pypa.io/):
 
 ```sh
+git clone https://github.com/billv5w/salesforce-metadata-compare.git
 cd salesforce-metadata-compare
 pipx install .
 ```
 
-Use `pipx install --force .` after updating the checkout. The Python package is named `metadata-compare-tool`; the installed command is `mct`.
+This gives you a global `mct` command. Use `pipx install --force .` after pulling updates. (The Python package is named `metadata-compare-tool`.)
 
-## Start the web interface
+## Quick start
+
+**Web interface** (recommended for first use):
 
 ```sh
 mct start
 ```
 
-The application opens a local browser page. Set the repository folder to your **Salesforce DX project**, then choose a branch, org alias, API version, and retrieval mode. This tool's checkout is separate from your DX project.
+A browser page opens. Click the workspace button, enter a name, the path to your DX project, a branch, and an org alias, then save. Use **Retrieve** to take snapshots and **Compare** to open the diff viewer.
 
-Create snapshots, choose the left/source and right/target snapshots, and open the comparison. The diff page supports:
+**Command line**, run from inside your DX project:
+
+```sh
+cd /path/to/dx-project
+mct snapshot-all --branch main --org my-sandbox     # snapshot the branch and the org
+mct list                                            # note the two snapshot IDs
+mct ui --left <branch-snapshot-id> --right <org-snapshot-id>
+```
+
+`mct` uses the current directory as the DX project unless you pass `--repo-root PATH`. Commands that need a DX project stop with a clear message if `sfdx-project.json` is not found.
+
+![Diff viewer showing changed Salesforce metadata files with a normalized XML diff](docs/images/diff-ui.png)
+
+## The diff viewer
+
+Choose the left/source and right/target snapshots and open the comparison. The diff page supports:
 
 - Active, accepted, ignored, and stale-acceptance classifications.
 - Metadata-type filters, file selection, and normalized XML/JSON diffs.
@@ -42,23 +60,20 @@ Create snapshots, choose the left/source and right/target snapshots, and open th
 
 Destructive manifest generation fails if Salesforce component names cannot be resolved accurately. Deploy-side resolution can fall back to a warning-marked heuristic; review warnings before using an export. Running any deployment commands from an exported bundle is a separate action performed by you.
 
-## Command-line examples
+## More command-line examples
 
 ```sh
 # Snapshot a Git branch and retrieve the corresponding metadata from an org.
-mct --repo-root /path/to/dx-project snapshot-org-from-source \
-  --branch main --org my-sandbox --wait-seconds 300
+mct snapshot-org-from-source --branch main --org my-sandbox --wait-seconds 300
 
-# List the resulting snapshot IDs.
-mct --repo-root /path/to/dx-project list --json
+# Retrieve in both directions so org-only components are visible too.
+mct snapshot-org-bidirectional --branch main --org my-sandbox
 
 # Compare two saved snapshots, with a nonzero exit when active drift exists.
-mct --repo-root /path/to/dx-project diff \
-  --left <source-snapshot-id> --right <target-snapshot-id> --fail-on-diff
+mct diff --left <source-snapshot-id> --right <target-snapshot-id> --fail-on-diff
 
-# Open the same comparison in the local diff interface.
-mct --repo-root /path/to/dx-project ui \
-  --left <source-snapshot-id> --right <target-snapshot-id>
+# Run against a DX project in another folder.
+mct --repo-root /path/to/dx-project list --json
 ```
 
 Run `mct --help` or `mct <command> --help` for options. See the [comparison workflows](docs/metadata-compare-workflow.md) and [CI drift-monitoring recipes](docs/ci-drift-monitoring.md).
@@ -67,11 +82,11 @@ Run `mct --help` or `mct <command> --help` for options. See the [comparison work
 
 Snapshots, baselines, and comparison history live outside the installed package, keyed by DX project:
 
-| Platform | Default data directory | Default configuration directory |
-| --- | --- | --- |
-| macOS | `~/Library/Application Support/mct` | `~/Library/Application Support/mct` |
-| Linux | `$XDG_DATA_HOME/mct` or `~/.local/share/mct` | `$XDG_CONFIG_HOME/mct` or `~/.config/mct` |
-| Windows | `%LOCALAPPDATA%\mct` | `%LOCALAPPDATA%\mct` |
+| Platform | Default data directory                       | Default configuration directory           |
+| -------- | -------------------------------------------- | ----------------------------------------- |
+| macOS    | `~/Library/Application Support/mct`          | `~/Library/Application Support/mct`       |
+| Linux    | `$XDG_DATA_HOME/mct` or `~/.local/share/mct` | `$XDG_CONFIG_HOME/mct` or `~/.config/mct` |
+| Windows  | `%LOCALAPPDATA%\mct`                         | `%LOCALAPPDATA%\mct`                      |
 
 Set `MCT_DATA_DIR` and `MCT_CONFIG_DIR` to override these locations. Generated manifests are written under your DX project's `manifest/` directory. Saved workspaces live in the configuration directory.
 
@@ -116,6 +131,8 @@ docs/               User and maintainer documentation
 ```
 
 The UI assets are vendored under `scripts/ui/kit/`; no sibling repository is required to run or develop this project.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow, [SECURITY.md](SECURITY.md) for reporting vulnerabilities, and [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 

@@ -47,6 +47,8 @@ blob-report/
 .codex/
 .agents/
 .vscode/
+.spec-workflow/
+docs/windsurf-*.md
 .coverage
 htmlcov/
 coverage/
