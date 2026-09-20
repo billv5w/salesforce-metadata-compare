@@ -144,7 +144,9 @@ def file_diff(left_path: Path, right_path: Path, ignore_ws: bool = False, ignore
     no symlink may appear on ANY component beneath the trusted comparison
     root and containment is verified before a byte is read — a cached
     index path whose ancestor was swapped for a link after the compare
-    cannot leak external content into the diff."""
+    cannot leak external content into the diff. The roots double as the
+    established anchors: pass the canonical ``TreeCompareResult`` roots so
+    a replaced root or ancestor is rejected instead of re-anchoring trust."""
     def _linked_error() -> dict:
         return {
             "error": "Symbolic links are never read as metadata "
@@ -154,9 +156,9 @@ def file_diff(left_path: Path, right_path: Path, ignore_ws: bool = False, ignore
 
     try:
         if left_root is not None:
-            left_path = check_metadata_read(left_root, left_path)
+            left_path = check_metadata_read(left_root, left_path, anchor=left_root)
         if right_root is not None:
-            right_path = check_metadata_read(right_root, right_path)
+            right_path = check_metadata_read(right_root, right_path, anchor=right_root)
     except LinkedMetadataError:
         return _linked_error()
     if left_path.is_symlink() or right_path.is_symlink():
@@ -234,7 +236,7 @@ def build_summary(left_root: Path, right_root: Path, left_rel: str, right_rel: s
     def _classify(disp: str, lp: Path | None, rp: Path | None, raw_status: str):
         status, detail = _baseline.classify_entry(
             disp, lp, rp, baseline, pair_key=PAIR_KEY,
-            left_root=left_root, right_root=right_root,
+            left_root=cmp.left_root, right_root=cmp.right_root,
         )
         base = {"path": disp, "type": metadata_type(disp), "side_status": raw_status}
         if status == "ignored":
@@ -284,8 +286,10 @@ def build_summary(left_root: Path, right_root: Path, left_rel: str, right_rel: s
         # Binary bodies have no text diff to render — flag them so reports
         # and the detail pane can explain instead of showing nothing.
         try:
-            lp_safe: Path | None = check_metadata_read(left_root, lp)
-            rp_safe: Path | None = check_metadata_read(right_root, rp)
+            lp_safe: Path | None = check_metadata_read(
+                left_root, lp, anchor=cmp.left_root)
+            rp_safe: Path | None = check_metadata_read(
+                right_root, rp, anchor=cmp.right_root)
         except LinkedMetadataError:
             lp_safe = rp_safe = None
         try:
@@ -377,13 +381,13 @@ def _embed_safe(text: str, tag: str) -> str:
     return text.replace(f"</{tag}", f"<\\/{tag}").replace("<!--", "<\\!--")
 
 
-def _file_meta(p: Path, root: Path) -> str:
+def _file_meta(p: Path, root: Path, *, anchor: Path | None = None) -> str:
     """Human-readable size+hash summary for report entries (binary changes).
     Reads through the trusted-root policy — linked paths are never hashed."""
     import hashlib
 
     try:
-        data = read_metadata_bytes(root, p)
+        data = read_metadata_bytes(root, p, anchor=anchor)
     except (OSError, LinkedMetadataError):
         return "unreadable"
     return f"{len(data)} bytes · sha256 {hashlib.sha256(data).hexdigest()[:12]}"
@@ -425,8 +429,10 @@ def _build_standalone_report(handler) -> str:
             "kind": "diff", "notice": "", "meta": "",
         }
         try:
-            lp_safe: Path | None = check_metadata_read(handler.left_root, lp)
-            rp_safe: Path | None = check_metadata_read(handler.right_root, rp)
+            lp_safe: Path | None = check_metadata_read(
+                handler.left_root, lp, anchor=cmp.left_root)
+            rp_safe: Path | None = check_metadata_read(
+                handler.right_root, rp, anchor=cmp.right_root)
         except LinkedMetadataError:
             lp_safe = rp_safe = None
         if lp_safe is None or rp_safe is None:
@@ -444,14 +450,14 @@ def _build_standalone_report(handler) -> str:
                 kind="binary",
                 notice="Binary content changed — no text diff available",
                 meta=(
-                    f"left: {_file_meta(lp_safe, handler.left_root)} · "
-                    f"right: {_file_meta(rp_safe, handler.right_root)}"
+                    f"left: {_file_meta(lp_safe, handler.left_root, anchor=cmp.left_root)} · "
+                    f"right: {_file_meta(rp_safe, handler.right_root, anchor=cmp.right_root)}"
                 ),
             )
         else:
             result = file_diff(
                 lp_safe, rp_safe,
-                left_root=handler.left_root, right_root=handler.right_root,
+                left_root=cmp.left_root, right_root=cmp.right_root,
             )
             if result.get("error"):
                 entry.update(
@@ -702,7 +708,7 @@ class DiffUIHandler(BaseUIHandler):
                 entry = _baseline.accept_diff(
                     disp, lp, rp, note=(body.get("note") or ""), baseline_file=BASELINE_FILE,
                     pair_key=PAIR_KEY,
-                    left_root=self.left_root, right_root=self.right_root,
+                    left_root=cmp.left_root, right_root=cmp.right_root,
                 )
             except _baseline.FingerprintReadError as exc:
                 self._serve_json({"ok": False, "error": str(exc)}, status=409)
@@ -755,11 +761,13 @@ class DiffUIHandler(BaseUIHandler):
         # path whose ancestor was swapped for a link since the compare
         # could expose out-of-tree files, so each path is re-verified
         # against its trusted root right now (fail closed on ANY link
-        # component beneath the root, not just the leaf).
+        # component beneath the root, not just the leaf). The comparison's
+        # captured canonical roots anchor the check — a replaced root or
+        # ancestor cannot re-anchor the boundary.
         for abs_path, _disp in deploy_files:
-            check_metadata_read(self.left_root, abs_path)
+            check_metadata_read(self.left_root, abs_path, anchor=cmp.left_root)
         for abs_path, _disp in destroy_files:
-            check_metadata_read(self.right_root, abs_path)
+            check_metadata_read(self.right_root, abs_path, anchor=cmp.right_root)
         if selected_paths is not None:
             sel = set(selected_paths)
             deploy_files = [e for e in deploy_files if e[1] in sel]
@@ -780,6 +788,7 @@ class DiffUIHandler(BaseUIHandler):
         moved out of the destructive set — package.xml must never name a
         member whose source the bundle doesn't ship.
         """
+        cmp = get_comparison(self.left_root, self.right_root)
         deploy_members, deploy_err = self._resolve_components_via_sf(
             [p for p, _ in deploy_files]
         )
@@ -793,7 +802,9 @@ class DiffUIHandler(BaseUIHandler):
                 [p for p, _ in destroy_files]
             )
             try:
-                context_dirs = self._left_context_dirs([d for _, d in destroy_files])
+                context_dirs = self._left_context_dirs(
+                    [d for _, d in destroy_files], anchor=cmp.left_root
+                )
             except LinkedMetadataError as exc:
                 return {
                     "error": (
@@ -864,7 +875,9 @@ class DiffUIHandler(BaseUIHandler):
                     if hits:
                         for f in sorted(d.rglob("*")):
                             try:
-                                check_metadata_read(self.left_root, f)
+                                check_metadata_read(
+                                    self.left_root, f, anchor=cmp.left_root
+                                )
                             except LinkedMetadataError:
                                 return {
                                     "error": (
@@ -876,7 +889,12 @@ class DiffUIHandler(BaseUIHandler):
                                 }
                             if f.is_file():
                                 context_deploy_files.append(
-                                    (f, f.relative_to(self.left_root).as_posix())
+                                    (
+                                        f,
+                                        f.relative_to(
+                                            cmp.left_root or self.left_root.resolve()
+                                        ).as_posix(),
+                                    )
                                 )
 
         response: dict = {}
@@ -955,6 +973,7 @@ class DiffUIHandler(BaseUIHandler):
             )
             return
         source_entries = self._bundle_source_entries(deploy_files + context_files)
+        cmp = get_comparison(self.left_root, self.right_root)
 
         readme = (
             "# Metadata delta bundle\n\n"
@@ -984,7 +1003,9 @@ class DiffUIHandler(BaseUIHandler):
         stripped: list[str] = []
 
         def _file_bytes(abs_path: Path, disp: str) -> bytes:
-            data = abs_path.read_bytes()
+            data = read_metadata_bytes(
+                self.left_root, abs_path, anchor=cmp.left_root
+            )
             if strip_no_grant and disp.lower().endswith(".xml"):
                 from mct.permissions import strip_no_grant_permissions
                 text, removed = strip_no_grant_permissions(
@@ -1005,7 +1026,9 @@ class DiffUIHandler(BaseUIHandler):
                 zf.writestr("destructiveChanges.xml", manifests["destructive_changes_xml"])
             for abs_path, disp in sorted(source_entries, key=lambda x: x[1].lower()):
                 try:
-                    safe_path = check_metadata_read(self.left_root, abs_path)
+                    safe_path = check_metadata_read(
+                        self.left_root, abs_path, anchor=cmp.left_root
+                    )
                 except LinkedMetadataError:
                     # A path whose ancestor was swapped for a link after
                     # indexing could smuggle an out-of-tree file into the
@@ -1014,6 +1037,10 @@ class DiffUIHandler(BaseUIHandler):
                     continue
                 try:
                     zf.writestr(f"delta-source/{disp}", _file_bytes(safe_path, disp))
+                except LinkedMetadataError:
+                    # A root/ancestor redirection or a leaf swapped for a
+                    # link between check and read — never read it.
+                    linked.append(disp)
                 except OSError:
                     missing.append(disp)
             if stripped:
@@ -1064,7 +1091,9 @@ class DiffUIHandler(BaseUIHandler):
             },
         )
 
-    def _left_context_dirs(self, destroy_display_paths: list[str]) -> list[Path]:
+    def _left_context_dirs(
+        self, destroy_display_paths: list[str], *, anchor: Path | None = None
+    ) -> list[Path]:
         """Left-tree directories corresponding to each destroy file's parent dir.
 
         A component's files are always colocated in one directory, so resolving
@@ -1072,14 +1101,18 @@ class DiffUIHandler(BaseUIHandler):
 
         Candidates are verified against the trusted left root BEFORE any
         resolution — resolving first and testing is_symlink() on the result
-        would erase the evidence of a linked ancestor."""
+        would erase the evidence of a linked ancestor. *anchor* is the
+        comparison's captured canonical root so a replaced root or ancestor
+        is rejected rather than silently re-anchored."""
         dirs: dict[Path, None] = {}
         for disp in destroy_display_paths:
             parent = Path(disp).parent
             candidate = (
                 self.left_root / parent if str(parent) != "." else self.left_root
             )
-            candidate = check_metadata_read(self.left_root, candidate)
+            candidate = check_metadata_read(
+                self.left_root, candidate, anchor=anchor
+            )
             if candidate.is_dir():
                 dirs[candidate] = None
         return list(dirs)
@@ -1277,7 +1310,7 @@ class DiffUIHandler(BaseUIHandler):
                 rp, _ = cmp.right_ix[key]
                 result = file_diff(
                     lp, rp, ignore_ws=ignore_ws, ignore_case=ignore_case,
-                    left_root=self.left_root, right_root=self.right_root,
+                    left_root=cmp.left_root, right_root=cmp.right_root,
                 )
                 self._serve_json(result)
             else:
@@ -1297,7 +1330,9 @@ class DiffUIHandler(BaseUIHandler):
         """Serve content of a file that only exists on one side."""
         root = self.left_root if side == "left" else self.right_root
         try:
-            filepath = check_metadata_read(root, filepath)
+            cmp = get_comparison(self.left_root, self.right_root)
+            anchor = cmp.left_root if side == "left" else cmp.right_root
+            filepath = check_metadata_read(root, filepath, anchor=anchor)
         except LinkedMetadataError:
             self._serve_json({
                 "error": "Symbolic links are never read as metadata "

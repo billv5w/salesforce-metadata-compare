@@ -931,8 +931,9 @@ def retrieve_delta(
     if delta_files:
         print(f"  Org-side drift: {len(delta_files)} file(s)", flush=True)
         from mct.retrieved_folder_compare import check_metadata_read
+        ranchor = result.right_root or right_abs
         safe_paths = [
-            check_metadata_read(result.right_root or right_abs, p)
+            check_metadata_read(ranchor, p, anchor=ranchor)
             for p, _ in delta_files
         ]
         members, err = _delta.resolve_components_via_sf(safe_paths)

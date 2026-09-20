@@ -29,13 +29,18 @@ from typing import Any
 import mct.config as _cfg
 
 
-def _collect_delta(left: str, right: str, use_baseline: bool):
-    """(expanded deploy files, destroy files) for the left→right delta.
+def _collect_delta_result(left: str, right: str, use_baseline: bool):
+    """(expanded deploy files, destroy files, TreeCompareResult) for the
+    left→right delta.
 
     Both sides are baseline-filtered active drift. *destroy files* are the
     right-only entries — deletions the ``--dry-run`` validator cannot cover
     (a validation deploy only exercises what package.xml deploys, never
     destructiveChanges.xml). Callers must not discard them.
+
+    The returned result carries the canonical roots captured at compare
+    time — reuse them as trusted anchors for any later metadata read so a
+    replaced root or ancestor cannot re-anchor the trust boundary.
     """
     import mct.baseline as _bl
     import mct.delta as _delta
@@ -64,7 +69,18 @@ def _collect_delta(left: str, right: str, use_baseline: bool):
         result, baseline, pair_key=pair_key
     )
 
-    return _delta.expand_deployable_files(result.left_ix, deploy_files), destroy_files
+    return (
+        _delta.expand_deployable_files(result.left_ix, deploy_files),
+        destroy_files,
+        result,
+    )
+
+
+def _collect_delta(left: str, right: str, use_baseline: bool):
+    """(expanded deploy files, destroy files) for the left→right delta —
+    2-tuple convenience wrapper over _collect_delta_result."""
+    entries, destroy_files, _result = _collect_delta_result(left, right, use_baseline)
+    return entries, destroy_files
 
 
 def _write_temp_project(
@@ -97,8 +113,8 @@ def _write_temp_project(
     src_root = proj / "force-app" / "main" / "default"
     for abs_path, disp in entries:
         if trusted_root is not None:
-            check_metadata_read(trusted_root, abs_path)
-            data = read_metadata_bytes(trusted_root, abs_path)
+            check_metadata_read(trusted_root, abs_path, anchor=trusted_root)
+            data = read_metadata_bytes(trusted_root, abs_path, anchor=trusted_root)
         else:
             if abs_path.is_symlink():
                 raise RuntimeError(
@@ -200,7 +216,7 @@ def run_validate_deploy(
 ) -> int:
     from mct.safety import run as _run_safe
 
-    entries, destroy_files = _collect_delta(left, right, use_baseline)
+    entries, destroy_files, result = _collect_delta_result(left, right, use_baseline)
     if not entries and not destroy_files:
         print("No active drift to validate — nothing to do.", flush=True)
         return 0
@@ -236,10 +252,11 @@ def run_validate_deploy(
         return 1
     print(f"  Delta: {len(entries)} deployable file(s)", flush=True)
 
-    from mct.index import abs_snapshot_or_project_rel, resolve_snapshot_or_path
-    left_root = abs_snapshot_or_project_rel(resolve_snapshot_or_path(left))
+    # The comparison's captured canonical root is the trust anchor — never
+    # re-resolve the selected path here, or a replaced root could establish
+    # a new boundary that still contains the external content.
     proj, stripped = _write_temp_project(
-        entries, api_version, strip_no_grant, trusted_root=left_root
+        entries, api_version, strip_no_grant, trusted_root=result.left_root
     )
     if stripped:
         print(f"  Stripped {len(stripped)} no-grant permission entr"

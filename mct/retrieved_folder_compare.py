@@ -77,17 +77,26 @@ class LinkedMetadataError(RuntimeError):
     """
 
 
-def check_metadata_read(root: Path, path: Path) -> Path:
+def check_metadata_read(
+    root: Path, path: Path, *, anchor: Path | None = None
+) -> Path:
     """Verify *path* is safe to read as metadata inside trusted *root*;
     return the resolved path.
 
-    Two independent fail-closed checks:
+    Three independent fail-closed checks:
 
-    1. Containment — the fully resolved path must stay beneath the
-       resolved root. Links at or above the root itself (system aliases
-       like ``/tmp`` → ``/private/tmp``) resolve identically and stay
-       valid; the restriction only applies to metadata beneath the root.
-    2. No symlink components beneath the root — every component between
+    1. Anchor stability — when *anchor* (the canonical root captured when
+       the comparison was established, e.g. ``TreeCompareResult.left_root``)
+       is given, it must still resolve to itself: a link swapped in AT the
+       root or at any ancestor above it changes its resolution. The spelled
+       root must likewise still resolve to that anchor — the boundary may
+       never be redefined by re-resolving a replaced root. Legitimate system
+       aliases (``/tmp`` → ``/private/tmp``) are canonicalized at selection
+       time, so the established anchor keeps working; a redirected root or
+       ancestor is rejected.
+    2. Containment — the fully resolved path must stay beneath the
+       resolved root.
+    3. No symlink components beneath the root — every component between
        the root and the target is lstat-checked on the path's OWN
        spelling. Resolving first and testing ``is_symlink()`` afterwards
        would erase the evidence: a link pointing back inside the root
@@ -95,15 +104,49 @@ def check_metadata_read(root: Path, path: Path) -> Path:
 
     Raises LinkedMetadataError for links and escapes. Callers that cache
     comparison results MUST re-verify at read time — a cached index path
-    can be swapped for a linked ancestor between requests.
+    can be swapped for a linked ancestor between requests — and MUST pass
+    the established canonical root as *anchor* so a replaced root cannot
+    re-anchor trust.
     """
-    root_path = Path(root)
+    root_path = Path(os.path.normpath(str(root)))
     p = Path(path)
     if not p.is_absolute():
         p = root_path / p
     p = Path(os.path.normpath(str(p)))
-    root_res = root_path.resolve()
-    resolved = p.resolve()
+    try:
+        root_res = root_path.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise LinkedMetadataError(
+            f"Trusted comparison root is not resolvable (link loop?): {root_path}"
+        ) from exc
+    if anchor is not None:
+        anchor_path = Path(os.path.normpath(str(anchor)))
+        try:
+            anchor_res = anchor_path.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise LinkedMetadataError(
+                "Trusted comparison root is not resolvable (link loop?): "
+                f"{anchor_path}"
+            ) from exc
+        if anchor_path.is_symlink() or anchor_res != anchor_path:
+            raise LinkedMetadataError(
+                "Trusted comparison root was replaced or redirected after "
+                "selection — refusing to re-anchor the boundary: "
+                f"{anchor_path} → {anchor_res}"
+            )
+        if root_res != anchor_path:
+            raise LinkedMetadataError(
+                "Metadata path's root no longer resolves to the trusted "
+                "comparison root established at selection: "
+                f"{root_path} → {root_res}"
+            )
+        root_res = anchor_path
+    try:
+        resolved = p.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise LinkedMetadataError(
+            f"Metadata path is not resolvable (link loop?): {p}"
+        ) from exc
     try:
         resolved.relative_to(root_res)
     except ValueError:
@@ -135,11 +178,13 @@ def check_metadata_read(root: Path, path: Path) -> Path:
     return resolved
 
 
-def read_metadata_bytes(root: Path, path: Path) -> bytes:
+def read_metadata_bytes(
+    root: Path, path: Path, *, anchor: Path | None = None
+) -> bytes:
     """check_metadata_read + byte read, with a no-follow open on the leaf
     where the platform supports it (O_NOFOLLOW) so a file swapped for a
     link after the checks cannot be read through."""
-    safe = check_metadata_read(root, path)
+    safe = check_metadata_read(root, path, anchor=anchor)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         with os.fdopen(os.open(safe, flags), "rb") as fh:

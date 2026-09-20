@@ -180,7 +180,9 @@ def compute_fingerprint(
     A fingerprint is a read boundary: linked files are never hashed. A
     direct link always fails; when *left_root*/*right_root* are given the
     full trusted-root policy applies, so a link on ANY ancestor beneath
-    the comparison root is rejected as well.
+    the comparison root is rejected as well. The roots act as the anchors
+    captured at comparison time — pass the canonical ``TreeCompareResult``
+    roots so a replaced root or ancestor cannot re-anchor trust.
     """
     from mct.json_normalizer import normalize_json
     from mct.retrieved_folder_compare import (
@@ -200,7 +202,7 @@ def compute_fingerprint(
                     f"Cannot fingerprint a symbolic link: {p}"
                 )
             data = (
-                read_metadata_bytes(root, p)
+                read_metadata_bytes(root, p, anchor=root)
                 if root is not None
                 else p.read_bytes()
             )
