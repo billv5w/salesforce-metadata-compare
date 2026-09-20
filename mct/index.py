@@ -109,14 +109,10 @@ def _file_lock(lock_path: Path, exclusive: bool):
     in msvcrt, so all locks are exclusive there — correct, just stricter.
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    if fcntl is not None:
-        with open(lock_path, "a", encoding="utf-8") as lf:
-            fcntl.flock(lf, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-            try:
-                yield
-            finally:
-                fcntl.flock(lf, fcntl.LOCK_UN)
-    else:
+    # Branch on sys.platform, not "module is not None": mypy resolves fcntl to
+    # an empty stub on win32 targets (and vice versa for msvcrt), so attribute
+    # access must sit inside a platform branch it can prove is unreachable.
+    if sys.platform == "win32":
         if msvcrt is None:
             raise RuntimeError("No file-locking backend available on this platform")
         with open(lock_path, "a+b") as lf:
@@ -127,6 +123,15 @@ def _file_lock(lock_path: Path, exclusive: bool):
             finally:
                 lf.seek(0)
                 msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
+    elif fcntl is not None:
+        with open(lock_path, "a", encoding="utf-8") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            try:
+                yield
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+    else:
+        raise RuntimeError("No file-locking backend available on this platform")
 
 
 def _write_json(path: Path, data: dict[str, Any], *, sort_keys: bool = False) -> None:
