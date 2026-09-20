@@ -167,7 +167,11 @@ def expand_deployable_files(
 
 
 def collect_deploy_files(
-    result, baseline, pair_key: str | None = None
+    result,
+    baseline,
+    pair_key: str | None = None,
+    managed_left: frozenset[str] | None = None,
+    managed_right: frozenset[str] | None = None,
 ) -> tuple[list[tuple[Path, str]], list[tuple[Path, str]]]:
     """(deploy_files, destroy_files) from ACTIVE drift only, as (abs, display)
     tuples. deploy = left copies of changed + left-only; destroy = right-only.
@@ -176,32 +180,47 @@ def collect_deploy_files(
     delta is consumed (manifests, ZIP bundles, validation), matching the
     summary classification. Stale acceptances count as active. *pair_key*
     scopes pair-qualified acceptances to this comparison.
+
+    *managed_left* / *managed_right*: installed-package namespaces of the
+    corresponding side's org. A file that exists only on one side and whose
+    component is namespaced under a package installed there is installation
+    drift — managed components cannot be deployed or destroyed via the
+    Metadata API anyway, so they are excluded like ignored entries.
     """
     from mct.baseline import classify_entry
+    from mct.comparison import managed_namespace_of
 
     lroot = getattr(result, "left_root", None)
     rroot = getattr(result, "right_root", None)
+    managed_union = (managed_left or frozenset()) | (managed_right or frozenset())
     deploy: list[tuple[Path, str]] = []
     destroy: list[tuple[Path, str]] = []
     for lp, rp, ld, _ in result.differ_pairs:
         status, _ = classify_entry(
             ld, lp, rp, baseline, pair_key=pair_key,
+            managed_namespaces=managed_union or None,
             left_root=lroot, right_root=rroot,
         )
         if status in ("active", "accepted_stale"):
             deploy.append((lp, ld))
     for k in result.only_left_keys:
         lp, disp = result.left_ix[k]
+        if managed_namespace_of(disp, managed_left or frozenset()):
+            continue
         status, _ = classify_entry(
             disp, lp, None, baseline, pair_key=pair_key,
+            managed_namespaces=managed_union or None,
             left_root=lroot, right_root=rroot,
         )
         if status in ("active", "accepted_stale"):
             deploy.append((lp, disp))
     for k in result.only_right_keys:
         rp, disp = result.right_ix[k]
+        if managed_namespace_of(disp, managed_right or frozenset()):
+            continue
         status, _ = classify_entry(
             disp, None, rp, baseline, pair_key=pair_key,
+            managed_namespaces=managed_union or None,
             left_root=lroot, right_root=rroot,
         )
         if status in ("active", "accepted_stale"):
@@ -210,7 +229,10 @@ def collect_deploy_files(
 
 
 def collect_reverse_sync_files(
-    result, baseline, pair_key: str | None = None
+    result,
+    baseline,
+    pair_key: str | None = None,
+    managed_right: frozenset[str] | None = None,
 ) -> list[tuple[Path, str]]:
     """Right-tree files representing org-side drift worth pulling back into git:
     changed files (right copy) and right-only files, minus baseline-ignored and
@@ -218,8 +240,12 @@ def collect_reverse_sync_files(
 
     *result* is a TreeCompareResult; returns (absolute right path, display) pairs.
     *pair_key* scopes pair-qualified acceptances to this comparison.
+    *managed_right*: installed-package namespaces of the right side's org —
+    right-only managed components are installation drift, not source drift,
+    and are excluded like ignored entries.
     """
     from mct.baseline import classify_entry
+    from mct.comparison import managed_namespace_of
 
     lroot = getattr(result, "left_root", None)
     rroot = getattr(result, "right_root", None)
@@ -227,14 +253,18 @@ def collect_reverse_sync_files(
     for lp, rp, ld, _ in result.differ_pairs:
         status, _detail = classify_entry(
             ld, lp, rp, baseline, pair_key=pair_key,
+            managed_namespaces=managed_right,
             left_root=lroot, right_root=rroot,
         )
         if status in ("active", "accepted_stale"):
             out.append((rp, ld))
     for k in result.only_right_keys:
         rp, disp = result.right_ix[k]
+        if managed_namespace_of(disp, managed_right or frozenset()):
+            continue
         status, _detail = classify_entry(
             disp, None, rp, baseline, pair_key=pair_key,
+            managed_namespaces=managed_right,
             left_root=lroot, right_root=rroot,
         )
         if status in ("active", "accepted_stale"):

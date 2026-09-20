@@ -58,6 +58,12 @@ BASELINE_FILE: Path | None = None
 # Comparison-pair scope for acceptances (branch:main↔org:prod style);
 # None when either side lacks provenance — acceptances are then global.
 PAIR_KEY: str | None = None
+# Installed-package namespaces of the org behind each side (empty when the
+# side is not an org snapshot or no packages snapshot exists). Managed
+# components present on only one side are classified apart from active
+# drift, and profile grants referencing them normalise away.
+MANAGED_LEFT: frozenset[str] = frozenset()
+MANAGED_RIGHT: frozenset[str] = frozenset()
 # Metadata-type scope (--include-type / --exclude-type, repeatable, from the
 # orchestrator form or env-compare ui). None/empty = unscoped comparison.
 INCLUDE_TYPES: frozenset[str] | None = None
@@ -93,8 +99,11 @@ def _cached_comparison(
     # between filter configurations.
     bl = active_baseline()
     ignore = _baseline.xml_ignore_elements(bl) or None
-    result = compare_trees(left, right, ignore, _baseline.strip_retrieve_defaults(bl),
-                           xml_ignore_by_type=_baseline.xml_ignore_by_type(bl) or None)
+    result = compare_trees(
+        left, right, ignore, _baseline.strip_retrieve_defaults(bl),
+        xml_ignore_by_type=_baseline.xml_ignore_by_type(bl) or None,
+        managed_namespaces=(MANAGED_LEFT | MANAGED_RIGHT) or None,
+    )
     return apply_type_scope(result, scope_key[0], scope_key[1])
 
 
@@ -235,11 +244,21 @@ def build_summary(left_root: Path, right_root: Path, left_rel: str, right_rel: s
     accepted: list[dict] = []
 
     def _classify(disp: str, lp: Path | None, rp: Path | None, raw_status: str):
+        base = {"path": disp, "type": metadata_type(disp), "side_status": raw_status}
+        # Managed-package components present on only one side are
+        # installation drift, not source drift — classified before baseline.
+        if lp is None or rp is None:
+            from mct.comparison import managed_namespace_of
+            side = MANAGED_LEFT if rp is None else MANAGED_RIGHT
+            ns = managed_namespace_of(disp, side)
+            if ns is not None:
+                ignored.append({**base, "status": "ignored", "rule": f"managed:{ns}"})
+                return None
         status, detail = _baseline.classify_entry(
             disp, lp, rp, baseline, pair_key=PAIR_KEY,
+            managed_namespaces=(MANAGED_LEFT | MANAGED_RIGHT) or None,
             left_root=cmp.left_root, right_root=cmp.right_root,
         )
-        base = {"path": disp, "type": metadata_type(disp), "side_status": raw_status}
         if status == "ignored":
             ignored.append({**base, "status": "ignored", "rule": detail or ""})
             return None
@@ -709,6 +728,7 @@ class DiffUIHandler(BaseUIHandler):
                 entry = _baseline.accept_diff(
                     disp, lp, rp, note=(body.get("note") or ""), baseline_file=BASELINE_FILE,
                     pair_key=PAIR_KEY,
+                    managed_namespaces=(MANAGED_LEFT | MANAGED_RIGHT) or None,
                     left_root=cmp.left_root, right_root=cmp.right_root,
                 )
             except _baseline.FingerprintReadError as exc:
@@ -755,7 +775,8 @@ class DiffUIHandler(BaseUIHandler):
             raise ValueError("selected_paths must be an array of strings")
         cmp = get_comparison(self.left_root, self.right_root)
         deploy_files, destroy_files = _delta.collect_deploy_files(
-            cmp, active_baseline(), pair_key=PAIR_KEY
+            cmp, active_baseline(), pair_key=PAIR_KEY,
+            managed_left=MANAGED_LEFT, managed_right=MANAGED_RIGHT,
         )
         # Everything downstream — sf manifest resolution, the zip bundle,
         # context expansion — reads through these paths. A cached index
@@ -1454,6 +1475,17 @@ def main() -> int:
     right_info = _parse_info(args.right_info)
     global PAIR_KEY
     PAIR_KEY = _baseline.pair_key_for(left_info, right_info)
+
+    global MANAGED_LEFT, MANAGED_RIGHT
+    from mct.comparison import managed_namespaces_for_org
+    MANAGED_LEFT = (
+        managed_namespaces_for_org(left_info["org_alias"])
+        if left_info and left_info.get("org_alias") else frozenset()
+    )
+    MANAGED_RIGHT = (
+        managed_namespaces_for_org(right_info["org_alias"])
+        if right_info and right_info.get("org_alias") else frozenset()
+    )
 
     global INCLUDE_TYPES, EXCLUDE_TYPES
     INCLUDE_TYPES = frozenset(

@@ -53,20 +53,35 @@ def _collect_delta_result(left: str, right: str, use_baseline: bool):
         raise RuntimeError(f"Both sides must be directories: {left_abs} / {right_abs}")
 
     baseline = _bl.load_baseline() if use_baseline else _bl.default_baseline()
+
+    from mct.comparison import (
+        _snapshot_provenance,
+        managed_namespaces_for_org,
+    )
+
+    left_info = _snapshot_provenance(left)
+    right_info = _snapshot_provenance(right)
+    managed_left = (
+        managed_namespaces_for_org(left_info["org_alias"])
+        if left_info and left_info.get("org_alias") else frozenset()
+    )
+    managed_right = (
+        managed_namespaces_for_org(right_info["org_alias"])
+        if right_info and right_info.get("org_alias") else frozenset()
+    )
+
     result = compare_trees(
         left_abs, right_abs,
         _bl.xml_ignore_elements(baseline) or None,
         _bl.strip_retrieve_defaults(baseline),
         xml_ignore_by_type=_bl.xml_ignore_by_type(baseline) or None,
+        managed_namespaces=(managed_left | managed_right) or None,
     )
 
-    from mct.comparison import _snapshot_provenance
-
-    pair_key = _bl.pair_key_for(
-        _snapshot_provenance(left), _snapshot_provenance(right)
-    )
+    pair_key = _bl.pair_key_for(left_info, right_info)
     deploy_files, destroy_files = _delta.collect_deploy_files(
-        result, baseline, pair_key=pair_key
+        result, baseline, pair_key=pair_key,
+        managed_left=managed_left, managed_right=managed_right,
     )
 
     return (

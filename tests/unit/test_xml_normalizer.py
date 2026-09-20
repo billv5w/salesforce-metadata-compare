@@ -745,3 +745,264 @@ class TestLayoutOrderPreservation:
         f_b = '<fields><name>Beta__c</name><label>Beta</label></fields>'
         cot = '<?xml version="1.0" encoding="UTF-8"?>\n<CustomObjectTranslation xmlns="%s">%%s</CustomObjectTranslation>\n' % SF_NS
         assert normalize_xml(cot % (f_a + f_b)) == normalize_xml(cot % (f_b + f_a))
+
+
+# ---------------------------------------------------------------------------
+# Case-insensitive API-name references
+# ---------------------------------------------------------------------------
+
+class TestCaseInsensitiveProfileRefs:
+    """Salesforce API names are case-insensitive, but retrieves sometimes
+    round-trip a reference in different case — observed live: org returned
+    ``adm_salesforcesystemadministrator`` where source had
+    ``ADM_SALESFORCESYSTEMADMINISTRATOR`` in ProfilePasswordPolicy, and a
+    lowercased profile name in a SharingSet. A case-only difference in an
+    API-name reference is never a deployable change."""
+
+    def _ppp(self, name: str) -> str:
+        return (
+            f'<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<ProfilePasswordPolicy xmlns="{SF_NS}">'
+            f'<forgotPasswordRedirect>false</forgotPasswordRedirect>'
+            f'<profile>{name}</profile>'
+            f'</ProfilePasswordPolicy>\n'
+        )
+
+    def test_profile_reference_casefolded(self):
+        a = self._ppp("ADM_SALESFORCESYSTEMADMINISTRATOR")
+        b = self._ppp("adm_salesforcesystemadministrator")
+        assert normalize_xml(a) == normalize_xml(b)
+
+    def test_sharing_set_profiles_casefolded(self):
+        def ss(name: str) -> str:
+            return (
+                f'<?xml version="1.0" encoding="UTF-8"?>\n'
+                f'<SharingSet xmlns="{SF_NS}">'
+                f'<name>Trial Portal Users</name>'
+                f'<profiles>{name}</profiles>'
+                f'</SharingSet>\n'
+            )
+        assert normalize_xml(ss("Trial Customer Portal User")) == \
+            normalize_xml(ss("trial customer portal user"))
+
+    def test_other_text_stays_case_sensitive(self):
+        a = _obj('<label>Foo</label>')
+        b = _obj('<label>foo</label>')
+        assert normalize_xml(a) != normalize_xml(b)
+
+
+# ---------------------------------------------------------------------------
+# Profile/PermissionSet grant noise
+# ---------------------------------------------------------------------------
+
+class TestProfileGrantDefaults:
+    """A grant element whose verdict fields are all at platform default
+    (enabled=false, visibility=DefaultOn, all-false objectPermissions, …)
+    carries the same meaning as its absence — the Metadata API omits
+    ungranted entries while committed source often records them. Observed
+    live: org profiles emitted ~410 ``standard-*`` tabVisibilities the
+    branch lacked purely because the org serialises defaults.
+
+    Restricted to Profile/PermissionSet/MutingPermissionSet roots; any
+    child leaf that is neither a known verdict field nor the element's
+    reference key keeps the element (unknown structure = keep)."""
+
+    def _profile(self, body: str, root: str = "Profile") -> str:
+        return (
+            f'<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<{root} xmlns="{SF_NS}"><custom>false</custom>{body}</{root}>\n'
+        )
+
+    def test_default_on_tab_dropped(self):
+        a = self._profile(
+            '<tabVisibilities><tab>standard-AssessmentTaskOrder</tab>'
+            '<visibility>DefaultOn</visibility></tabVisibilities>')
+        b = self._profile('')
+        assert normalize_xml(a) == normalize_xml(b)
+
+    def test_hidden_tab_kept(self):
+        a = self._profile(
+            '<tabVisibilities><tab>standard-X</tab>'
+            '<visibility>Hidden</visibility></tabVisibilities>')
+        b = self._profile('')
+        assert normalize_xml(a) != normalize_xml(b)
+
+    def test_disabled_accesses_dropped(self):
+        for tag, ref in (("classAccesses", "apexClass"),
+                         ("pageAccesses", "apexPage"),
+                         ("flowAccesses", "flow"),
+                         ("customPermissions", "name"),
+                         ("userPermissions", "name")):
+            a = self._profile(
+                f'<{tag}><enabled>false</enabled><{ref}>X</{ref}></{tag}>')
+            assert normalize_xml(a) == normalize_xml(self._profile('')), tag
+
+    def test_enabled_access_kept(self):
+        a = self._profile(
+            '<classAccesses><apexClass>X</apexClass><enabled>true</enabled></classAccesses>')
+        assert normalize_xml(a) != normalize_xml(self._profile(''))
+
+    def test_all_false_field_permissions_dropped(self):
+        a = self._profile(
+            '<fieldPermissions><editable>false</editable>'
+            '<field>Account.F__c</field><readable>false</readable></fieldPermissions>')
+        assert normalize_xml(a) == normalize_xml(self._profile(''))
+
+    def test_partial_field_permissions_kept(self):
+        a = self._profile(
+            '<fieldPermissions><editable>false</editable>'
+            '<field>Account.F__c</field><readable>true</readable></fieldPermissions>')
+        assert normalize_xml(a) != normalize_xml(self._profile(''))
+
+    def test_all_false_object_permissions_dropped(self):
+        a = self._profile(
+            '<objectPermissions><allowCreate>false</allowCreate>'
+            '<allowDelete>false</allowDelete><allowEdit>false</allowEdit>'
+            '<allowRead>false</allowRead><modifyAllRecords>false</modifyAllRecords>'
+            '<object>Case</object><viewAllRecords>false</viewAllRecords>'
+            '</objectPermissions>')
+        assert normalize_xml(a) == normalize_xml(self._profile(''))
+
+    def test_record_type_visibility_all_default_dropped(self):
+        a = self._profile(
+            '<recordTypeVisibilities><default>false</default>'
+            '<recordType>Case.RT</recordType><visible>false</visible>'
+            '</recordTypeVisibilities>')
+        assert normalize_xml(a) == normalize_xml(self._profile(''))
+
+    def test_default_record_type_kept(self):
+        a = self._profile(
+            '<recordTypeVisibilities><default>true</default>'
+            '<recordType>Case.RT</recordType><visible>true</visible>'
+            '</recordTypeVisibilities>')
+        assert normalize_xml(a) != normalize_xml(self._profile(''))
+
+    def test_no_verdict_leaf_never_dropped(self):
+        # layoutAssignments has only reference fields — nothing marks it as
+        # a default grant, so it must never be dropped.
+        a = self._profile(
+            '<layoutAssignments><layout>Case-Layout</layout></layoutAssignments>')
+        assert normalize_xml(a) != normalize_xml(self._profile(''))
+
+    def test_unknown_extra_leaf_keeps_element(self):
+        a = self._profile(
+            '<classAccesses><apexClass>X</apexClass><enabled>false</enabled>'
+            '<somethingElse>y</somethingElse></classAccesses>')
+        assert normalize_xml(a) != normalize_xml(self._profile(''))
+
+    def test_permission_set_root_also_normalised(self):
+        a = self._profile(
+            '<tabVisibilities><tab>standard-X</tab>'
+            '<visibility>DefaultOn</visibility></tabVisibilities>',
+            root="PermissionSet")
+        b = self._profile('', root="PermissionSet")
+        assert normalize_xml(a) == normalize_xml(b)
+
+    def test_non_profile_root_untouched(self):
+        # <enabled>false</enabled> outside a profile root is content.
+        a = f'<?xml version="1.0" encoding="UTF-8"?>\n<Flow xmlns="{SF_NS}">' \
+            '<processMetadataValues><name>BuilderType</name>' \
+            '<value><stringValue>false</stringValue></value>' \
+            '</processMetadataValues></Flow>\n'
+        b = f'<?xml version="1.0" encoding="UTF-8"?>\n<Flow xmlns="{SF_NS}"/>\n'
+        assert normalize_xml(a) != normalize_xml(b)
+
+
+class TestManagedNamespaceGrants:
+    """Grant elements referencing installed managed-package components
+    (``NS__``-prefixed references) cannot be expressed in a source manifest
+    that does not track the package — both sides drop them when the org's
+    managed namespaces are known. Observed live: ~620 LLC_BI__* tab
+    visibilities surfaced as profile drift."""
+
+    def _profile(self, body: str) -> str:
+        return (
+            f'<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<Profile xmlns="{SF_NS}">{body}</Profile>\n'
+        )
+
+    def test_managed_tab_dropped_even_when_non_default(self):
+        a = self._profile(
+            '<tabVisibilities><tab>LLC_BI__Adverse_Action__c</tab>'
+            '<visibility>Hidden</visibility></tabVisibilities>')
+        assert normalize_xml(a, managed_namespaces=frozenset({"llc_bi"})) == \
+            normalize_xml(self._profile(''), managed_namespaces=frozenset({"llc_bi"}))
+
+    def test_managed_tab_kept_without_namespace_info(self):
+        a = self._profile(
+            '<tabVisibilities><tab>LLC_BI__Adverse_Action__c</tab>'
+            '<visibility>Hidden</visibility></tabVisibilities>')
+        assert normalize_xml(a) != normalize_xml(self._profile(''))
+
+    def test_managed_field_permission_dropped(self):
+        a = self._profile(
+            '<fieldPermissions><editable>true</editable>'
+            '<field>Opportunity.LLC_BI__Amount__c</field>'
+            '<readable>true</readable></fieldPermissions>')
+        assert normalize_xml(a, managed_namespaces=frozenset({"LLC_BI"})) == \
+            normalize_xml(self._profile(''), managed_namespaces=frozenset({"LLC_BI"}))
+
+    def test_unmanaged_field_permission_kept(self):
+        a = self._profile(
+            '<fieldPermissions><editable>true</editable>'
+            '<field>Opportunity.Amount</field><readable>true</readable>'
+            '</fieldPermissions>')
+        assert normalize_xml(a, managed_namespaces=frozenset({"LLC_BI"})) != \
+            normalize_xml(self._profile(''), managed_namespaces=frozenset({"LLC_BI"}))
+
+    def test_custom_suffix_not_treated_as_namespace(self):
+        # Foo__c is a custom-object suffix, not a namespace — must not be
+        # dropped even if a namespace named "foo" is installed.
+        a = self._profile(
+            '<tabVisibilities><tab>Foo__c</tab><visibility>Hidden</visibility>'
+            '</tabVisibilities>')
+        assert normalize_xml(a, managed_namespaces=frozenset({"foo"})) != \
+            normalize_xml(self._profile(''), managed_namespaces=frozenset({"foo"}))
+
+
+# ---------------------------------------------------------------------------
+# Settings: absent ≡ false under strip_defaults
+# ---------------------------------------------------------------------------
+
+class TestSettingsAbsentIsFalse:
+    """*Settings documents are flat leaf maps; the Metadata API emits newer
+    elements with their default ``false`` while older-API source omits them.
+    Under strip_retrieve_defaults, a ``false`` leaf equals its absence.
+    Deliberately NOT applied to ``true``: a present ``true`` vs absent may
+    hide a real enablement, so it still diffs. Opt-in because a non-default
+    ``false`` (element whose platform default is true) would be hidden."""
+
+    def _settings(self, body: str, root: str = "CaseSettings") -> str:
+        return (
+            f'<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<{root} xmlns="{SF_NS}">{body}</{root}>\n'
+        )
+
+    def test_false_leaf_equals_absent(self):
+        a = self._settings('<enableEmailSenderIdCompliance>false</enableEmailSenderIdCompliance>')
+        b = self._settings('')
+        assert normalize_xml(a, strip_defaults=True) == normalize_xml(b, strip_defaults=True)
+
+    def test_false_leaf_still_differs_without_opt_in(self):
+        a = self._settings('<enableX>false</enableX>')
+        b = self._settings('')
+        assert normalize_xml(a) != normalize_xml(b)
+
+    def test_true_leaf_still_differs(self):
+        a = self._settings('<enableX>true</enableX>')
+        b = self._settings('')
+        assert normalize_xml(a, strip_defaults=True) != normalize_xml(b, strip_defaults=True)
+
+    def test_non_boolean_leaf_still_differs(self):
+        a = self._settings('<aiAttributionTimeframe>6</aiAttributionTimeframe>')
+        b = self._settings('')
+        assert normalize_xml(a, strip_defaults=True) != normalize_xml(b, strip_defaults=True)
+
+    def test_only_settings_roots_affected(self):
+        a = _obj('<enableFeeds>false</enableFeeds>')
+        b = _obj('')
+        # CustomObject.enableFeeds is already in _RETRIEVE_DEFAULTS; use a
+        # leaf that is NOT curated to prove the Settings rule doesn't leak.
+        c = _obj('<someUncuratedFlag>false</someUncuratedFlag>')
+        assert normalize_xml(c, strip_defaults=True) != normalize_xml(b, strip_defaults=True)
+        assert normalize_xml(a, strip_defaults=True) == normalize_xml(b, strip_defaults=True)

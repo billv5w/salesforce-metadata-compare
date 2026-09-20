@@ -1006,20 +1006,35 @@ def retrieve_delta(
         raise RuntimeError(f"Both sides must be directories: {left_abs} / {right_abs}")
 
     baseline = _bl.load_baseline() if use_baseline else _bl.default_baseline()
+
+    from mct.comparison import (
+        _snapshot_provenance,
+        managed_namespace_of,
+        managed_namespaces_for_org,
+    )
+
+    left_info = _snapshot_provenance(left)
+    right_info = _snapshot_provenance(right)
+    managed_left = (
+        managed_namespaces_for_org(left_info["org_alias"])
+        if left_info and left_info.get("org_alias") else frozenset()
+    )
+    managed_right = (
+        managed_namespaces_for_org(right_info["org_alias"])
+        if right_info and right_info.get("org_alias") else frozenset()
+    )
+
     result = compare_trees(
         left_abs, right_abs,
         _bl.xml_ignore_elements(baseline) or None,
         _bl.strip_retrieve_defaults(baseline),
         xml_ignore_by_type=_bl.xml_ignore_by_type(baseline) or None,
+        managed_namespaces=(managed_left | managed_right) or None,
     )
 
-    from mct.comparison import _snapshot_provenance
-
-    pair_key = _bl.pair_key_for(
-        _snapshot_provenance(left), _snapshot_provenance(right)
-    )
+    pair_key = _bl.pair_key_for(left_info, right_info)
     delta_files = _delta.collect_reverse_sync_files(
-        result, baseline, pair_key=pair_key
+        result, baseline, pair_key=pair_key, managed_right=managed_right
     )
 
     # Deletions cannot be retrieved: components present in source but absent
@@ -1027,8 +1042,11 @@ def retrieve_delta(
     deletions: list[str] = []
     for k in result.only_left_keys:
         lp, disp = result.left_ix[k]
+        if managed_namespace_of(disp, managed_left):
+            continue
         status, _ = _bl.classify_entry(
             disp, lp, None, baseline, pair_key=pair_key,
+            managed_namespaces=(managed_left | managed_right) or None,
             left_root=result.left_root, right_root=result.right_root,
         )
         if status in ("active", "accepted_stale"):

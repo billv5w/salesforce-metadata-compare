@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+
+- Managed-package classification: when the compared org has an installed-packages snapshot, files present on only one side under an installed namespace (for example `LLC_BI__*`) are classified as `managed:<ns>` ignored entries instead of active drift, in the CLI diff, compare matrix, and diff UI. The same namespaces are excluded from deploy/destroy exports and reverse-sync retrieval.
+- Profile and PermissionSet normalization now drops grants that reference installed managed-package components (`ns__` prefixes in tab, field, object, class, and similar references), and grants whose verdicts are all at their platform default (`visibility` = `DefaultOn`, all-false permissions) — both are semantically identical to the grant being absent.
+- `<profile>` / `<profiles>` element text is compared case-insensitively; Salesforce treats these API-name references case-insensitively and retrieves round-trip them in varying case.
+- With `strip_retrieve_defaults` enabled, `*Settings` documents treat an absent leaf element as equal to an explicit `false` — the Metadata API emits newer elements at their default while source committed under an older API omits them.
+- The pipx install instructions now warn that reinstalling a pre-externalization build deletes its in-venv snapshot store, and direct users to run `mct migrate` first.
+
 ### Fixed
 
 - Chunked retrieves no longer hollow out Profiles and PermissionSets or overwrite retrieved objects with empty stubs. Each request now retrieves into its own directory and is merged stub-aware, and profile-like types are sent in one dedicated request that carries the manifest's scope-defining members. Observed on a 19k-file org: 75 profiles and 93 objects were reported as drift when the org matched the branch.

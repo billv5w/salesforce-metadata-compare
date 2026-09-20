@@ -25,6 +25,13 @@ pipx install .
 
 This gives you a global `mct` command. Use `pipx install --force .` after pulling updates. (The Python package is named `metadata-compare-tool`.)
 
+> **Upgrading a build installed before the data directory was externalized:**
+> those builds stored snapshots _inside_ the pipx virtualenv
+> (`.../pipx/venvs/metadata-compare-tool/.../.metadata-compare/`), which
+> `pipx install --force` deletes. Run `mct migrate` **before** reinstalling —
+> it copies your snapshots to the data directory below and preserves the
+> originals. If you already reinstalled, the old store is gone with the venv.
+
 ## Quick start
 
 **Web interface** (recommended for first use):
@@ -95,7 +102,8 @@ For data from an older installation, run `mct migrate --legacy-root /path/to/old
 ## Comparison limits
 
 - Comparison covers retrieved files. Missing or failed retrievals are not proof that a component was deleted from an org; inspect retrieval warnings and scope.
-- Namespaced managed-package round-trips are only partially supported. Source-manifest generation can drop a namespace prefix, causing a follow-on retrieve to omit that component.
+- Managed-package components are classified, not silently dropped: when the org has an installed-packages snapshot (`mct snapshot-packages`), files present on only one side under an installed namespace (for example `LLC_BI__*`) are reported as `managed:<ns>` in the ignored section rather than active drift, and deploy/destroy exports exclude them. Profile and PermissionSet grants that reference managed components are normalized away, as are grants whose verdicts are all at their platform default (for example `visibility` = `DefaultOn`). Without a packages snapshot no namespace assumptions are made.
+- Source-manifest generation can still drop a namespace prefix on namespaced components tracked in source, causing a follow-on retrieve to omit that component.
 - Profile and PermissionSet contents depend on the request's metadata scope. Chunked retrievals send these types in one dedicated request together with the manifest's scope-defining members (objects, fields, classes, tabs, FlowDefinitions, and so on). That request is never split; if it exceeds the chunk cap a warning is recorded and it is sent whole. Scope is still limited to manifest members — entries for org-only components (for example managed-package tabs) only appear when the manifest includes them, which `snapshot-org-bidirectional` does via its union manifest.
 - XML above the normalizer size cap is compared byte-for-byte and flagged as `normalization_skipped`. Order-sensitive structures are preserved; supported unordered XML collections and JSON object keys are normalized.
 - Accepting a difference is a comparison baseline decision, not a change to Salesforce metadata. Accepted entries can become stale when the compared content changes.

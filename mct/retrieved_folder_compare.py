@@ -276,6 +276,7 @@ def compare_trees(
     xml_ignore_elements: frozenset[str] | None = None,
     xml_strip_defaults: bool = False,
     xml_ignore_by_type: dict[str, frozenset[str]] | None = None,
+    managed_namespaces: frozenset[str] | None = None,
 ) -> TreeCompareResult:
     left_ix = index_tree(left_root)
     right_ix = index_tree(right_root)
@@ -299,7 +300,8 @@ def compare_trees(
         elif lp.suffix.lower() == ".xml" and xml_semantically_equal(
                 lp, rp,
                 effective_ignore_for(ld, xml_ignore_elements, xml_ignore_by_type),
-                xml_strip_defaults):
+                xml_strip_defaults,
+                managed_namespaces=managed_namespaces):
             identical_count += 1  # formatting-only difference, not a real change
             identical_normalized_list.append((lp, rp, ld, rd))
         elif lp.suffix.lower() == ".json" and json_semantically_equal(lp, rp):

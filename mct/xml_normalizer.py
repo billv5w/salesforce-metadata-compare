@@ -275,6 +275,13 @@ def _sorted_group(group: list[ET.Element]) -> list[ET.Element]:
 # Recursive normalisation
 # ---------------------------------------------------------------------------
 
+# Leaf elements whose text is a case-insensitive API-name reference —
+# retrieves round-trip these in varying case (observed: org returned
+# adm_salesforcesystemadministrator where source had the uppercased form).
+# A case-only difference there can never be a deployable change.
+_CASE_INSENSITIVE_REFS: frozenset[str] = frozenset({"profile", "profiles"})
+
+
 def _normalize_leaf_text(text: str | None) -> str | None:
     """Canonicalise a leaf element's text content.
 
@@ -319,6 +326,8 @@ def _normalize_element(el: ET.Element) -> None:
     children = list(el)
     if not children:
         el.text = _normalize_leaf_text(el.text)
+        if el.text and _local(el.tag) in _CASE_INSENSITIVE_REFS:
+            el.text = el.text.casefold()
         if (el.text and _local(el.tag) in _NUMERIC_ELEMENTS
                 and _NUMERIC_RE.match(el.text)):
             el.text = _canonical_number(el.text)
@@ -406,13 +415,151 @@ _RETRIEVE_DEFAULTS: dict[str, dict[str, str]] = {
 
 def _strip_default_elements(root: ET.Element) -> None:
     table = _RETRIEVE_DEFAULTS.get(_local(root.tag))
-    if not table:
-        return
-    for child in list(root):
-        default = table.get(_local(child.tag))
-        if default is not None and len(child) == 0:
-            if (child.text or "").strip().lower() == default.lower():
+    if table:
+        for child in list(root):
+            default = table.get(_local(child.tag))
+            if default is not None and len(child) == 0:
+                if (child.text or "").strip().lower() == default.lower():
+                    root.remove(child)
+    # *Settings documents are flat leaf maps: the API emits newer elements
+    # with their default "false" while source committed under an older API
+    # omits them, so a false leaf equals its absence. Deliberately not
+    # applied to "true" — a present true vs absent could hide a real
+    # enablement.
+    if _local(root.tag).lower().endswith("settings"):
+        for child in list(root):
+            if len(child) == 0 and (child.text or "").strip().lower() == "false":
                 root.remove(child)
+
+
+# ---------------------------------------------------------------------------
+# Profile/PermissionSet grant noise
+# ---------------------------------------------------------------------------
+
+# Roots whose direct children can be permission-grant elements.
+_PROFILE_ROOTS: frozenset[str] = frozenset({
+    "profile", "permissionset", "mutingpermissionset",
+})
+
+# Grant-bearing element tags (a subset of _ELEMENT_KEY_FIELDS keys that grant
+# access). Elements without a verdict field (layoutAssignments, loginFlows,
+# profileActionOverrides, …) are never dropped — the rule below requires at
+# least one verdict leaf at its default value.
+_GRANT_TAGS: frozenset[str] = frozenset({
+    "applicationVisibilities",
+    "categoryGroupVisibilities",
+    "classAccesses",
+    "customMetadataTypeAccesses",
+    "customPermissions",
+    "customSettingAccesses",
+    "dataspaceScopes",
+    "emailRoutingAddressAccesses",
+    "externalCredentialPrincipalAccesses",
+    "externalDataSourceAccesses",
+    "fieldPermissions",
+    "flowAccesses",
+    "layoutAssignments",
+    "loginFlows",
+    "objectPermissions",
+    "pageAccesses",
+    "profileActionOverrides",
+    "recordTypeVisibilities",
+    "tabVisibilities",
+    "userPermissions",
+})
+
+# Verdict leaf → platform default value (compared case-insensitively). A
+# grant whose verdicts are all at default means "no access" — the same as
+# the grant being absent, which is how the Metadata API represents it.
+_VERDICT_DEFAULTS: dict[str, str] = {
+    "enabled": "false",
+    "visible": "false",
+    "readable": "false",
+    "editable": "false",
+    "default": "false",
+    "personaccountdefault": "false",
+    "allowcreate": "false",
+    "allowread": "false",
+    "allowedit": "false",
+    "allowdelete": "false",
+    "modifyallrecords": "false",
+    "viewallrecords": "false",
+    "viewallfields": "false",
+    "visibility": "defaulton",
+}
+
+
+# Suffixes that make ``Foo__c`` an unmanaged custom component, not the
+# managed name ``foo__C``. A real namespace prefix is always followed by a
+# further name (``ns__Thing__c``), never by just a suffix.
+_CUSTOM_SUFFIXES: frozenset[str] = frozenset({
+    "c", "e", "r", "x", "b", "del", "hd", "p", "mdt", "ka", "kav",
+    "feed", "history", "share", "tag", "changeevent", "partner", "pov",
+})
+
+
+def managed_ns_of_name(name: str, managed: frozenset[str]) -> str | None:
+    """The installed managed-package namespace that *name* (a single component
+    name or one dot-separated reference segment) belongs to, e.g.
+    ``LLC_BI__Collateral__c`` → ``llc_bi`` when ``llc_bi`` is in *managed*.
+
+    Returns None for unmanaged names — including ``Foo__c``-style names where
+    the part after ``__`` is only a standard custom suffix. *managed* is
+    compared case-folded.
+    """
+    if "__" not in name:
+        return None
+    ns, rest = name.split("__", 1)
+    if not ns or rest.casefold() in _CUSTOM_SUFFIXES:
+        return None
+    return ns.casefold() if ns.casefold() in managed else None
+
+
+def _ref_has_managed_ns(ref: str, managed: frozenset[str]) -> bool:
+    """True if any dot-separated segment of *ref* is ``<ns>__something`` with
+    *ns* an installed managed-package namespace — covers both
+    ``ns__Component`` refs and ``Object.ns__Field__c`` field refs."""
+    return any(managed_ns_of_name(seg, managed) for seg in ref.split("."))
+
+
+def _drop_profile_grant_noise(
+    root: ET.Element, managed: frozenset[str] | None
+) -> None:
+    """Remove grant elements that cannot carry information:
+
+    - the grant references an installed managed package's components
+      (``ns__`` prefix) — a source manifest that does not track the package
+      can never express them, and the org emits them for every profile;
+    - every verdict leaf is at its platform default (enabled=false,
+      visibility=DefaultOn, all-false objectPermissions, …) — semantically
+      identical to the grant being absent.
+
+    Any non-leaf child, missing verdict leaf, or leaf that is neither a
+    verdict nor the element's reference key keeps the element.
+    """
+    managed_folded = frozenset(n.casefold() for n in managed) if managed else frozenset()
+    for child in list(root):
+        tag = _local(child.tag)
+        if tag not in _GRANT_TAGS:
+            continue
+        key = _ELEMENT_KEY_FIELDS.get(tag)
+        ref_fields = {key} if isinstance(key, str) else set(key or ())
+        leaves = [c for c in child if len(c) == 0]
+        if len(leaves) != len(child):  # nested structure — don't guess
+            continue
+        texts = {_local(c.tag): (c.text or "").strip() for c in leaves}
+        if managed_folded and any(
+            _ref_has_managed_ns(texts.get(f, ""), managed_folded) for f in ref_fields
+        ):
+            root.remove(child)
+            continue
+        verdicts = {
+            t: v for t, v in texts.items() if t.lower() in _VERDICT_DEFAULTS
+        }
+        if (verdicts
+                and all(v.lower() == _VERDICT_DEFAULTS[t.lower()] for t, v in verdicts.items())
+                and all(t in ref_fields for t in texts if t.lower() not in _VERDICT_DEFAULTS)):
+            root.remove(child)
 
 
 def _strip_ignored_elements(el: ET.Element, ignore: frozenset[str]) -> None:
@@ -433,6 +580,7 @@ def normalize_xml(
     text: str,
     ignore_elements: frozenset[str] | None = None,
     strip_defaults: bool = False,
+    managed_namespaces: frozenset[str] | None = None,
 ) -> str:
     """
     Parse *text* as XML, apply canonical normalisation, return canonical string.
@@ -443,7 +591,13 @@ def normalize_xml(
     *ignore_elements*: local element names to drop entirely before
     normalisation (baseline noise rules). None/empty means keep everything.
     *strip_defaults*: drop root-level elements equal to their Metadata-API
-    default value (see _RETRIEVE_DEFAULTS). Opt-in via the baseline.
+    default value (see _RETRIEVE_DEFAULTS), and treat absent *Settings leaves
+    as ``false``. Opt-in via the baseline.
+    *managed_namespaces*: installed-package namespaces of the compared org;
+    in Profile/PermissionSet documents, grant elements referencing
+    ``ns__``-prefixed components are dropped (a source manifest cannot
+    express them). Default-valued grants are always dropped under
+    profile-type roots.
     """
     # Normalise line endings before parsing (avoids CRLF artefacts in text nodes)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -460,6 +614,8 @@ def normalize_xml(
         _strip_ignored_elements(root, ignore_elements)
     if strip_defaults:
         _strip_default_elements(root)
+    if _local(root.tag).lower() in _PROFILE_ROOTS:
+        _drop_profile_grant_noise(root, managed_namespaces)
 
     _normalize_element(root)
 
@@ -470,7 +626,9 @@ def normalize_xml(
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + body + "\n"
 
 
-def normalize_xml_lines(path: Path) -> list[str]:
+def normalize_xml_lines(
+    path: Path, managed_namespaces: frozenset[str] | None = None
+) -> list[str]:
     """
     Read *path*, normalise its XML content, and return lines with line endings.
 
@@ -478,7 +636,9 @@ def normalize_xml_lines(path: Path) -> list[str]:
     valid XML, so the caller can always use the result for diffing.
     """
     text = path.read_text(encoding="utf-8", errors="replace")
-    normalised = normalize_xml(text)  # safe: returns original text on parse error
+    normalised = normalize_xml(
+        text, managed_namespaces=managed_namespaces
+    )  # safe: returns original text on parse error
     return normalised.splitlines(keepends=True)
 
 
@@ -487,6 +647,7 @@ def xml_semantically_equal(
     rp: Path,
     ignore_elements: frozenset[str] | None = None,
     strip_defaults: bool = False,
+    managed_namespaces: frozenset[str] | None = None,
 ) -> bool:
     """
     Return True if *lp* and *rp* represent the same XML after normalisation.
@@ -497,7 +658,7 @@ def xml_semantically_equal(
     try:
         lt = lp.read_text(encoding="utf-8", errors="replace")
         rt = rp.read_text(encoding="utf-8", errors="replace")
-        return (normalize_xml(lt, ignore_elements, strip_defaults)
-                == normalize_xml(rt, ignore_elements, strip_defaults))
+        return (normalize_xml(lt, ignore_elements, strip_defaults, managed_namespaces)
+                == normalize_xml(rt, ignore_elements, strip_defaults, managed_namespaces))
     except Exception:
         return False

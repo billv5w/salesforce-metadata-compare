@@ -148,6 +148,7 @@ def compute_fingerprint(
     rp: Path | None,
     ignore: frozenset[str] | None = None,
     strip_defaults: bool = False,
+    managed_namespaces: frozenset[str] | None = None,
     *,
     left_root: Path | None = None,
     right_root: Path | None = None,
@@ -161,7 +162,10 @@ def compute_fingerprint(
     canonicalisation is applied only where the comparison engine applies
     the same equivalence rule:
 
-      - ``.xml``   → ``normalize_xml`` (as ``xml_semantically_equal``)
+      - ``.xml``   → ``normalize_xml`` (as ``xml_semantically_equal``;
+                     pass the same *managed_namespaces* the comparison ran
+                     with so accepted fingerprints cover the view the user
+                     actually saw)
       - ``.json``  → ``normalize_json`` (as ``json_semantically_equal``)
       - text types → CRLF→LF + trailing-whitespace strip, on bytes exactly
                      as ``text_equal_ignoring_line_endings``
@@ -213,7 +217,8 @@ def compute_fingerprint(
         suffix = p.suffix.lower()
         if suffix == ".xml":
             return b"norm", normalize_xml(
-                data.decode("utf-8", errors="replace"), ignore, strip_defaults
+                data.decode("utf-8", errors="replace"), ignore,
+                strip_defaults, managed_namespaces,
             ).encode("utf-8")
         if suffix == ".json":
             return b"norm", normalize_json(
@@ -266,6 +271,7 @@ def accept_diff(
     note: str = "",
     baseline_file: Path | None = None,
     pair_key: str | None = None,
+    managed_namespaces: frozenset[str] | None = None,
     *,
     left_root: Path | None = None,
     right_root: Path | None = None,
@@ -274,6 +280,8 @@ def accept_diff(
 
     With *pair_key* the acceptance applies only to that comparison pair;
     without it (legacy / plain-path comparisons) it applies everywhere.
+    Pass the *managed_namespaces* the comparison ran with so the stored
+    fingerprint covers the same normalized view the user accepted.
     """
     from mct.index import locked_update
 
@@ -281,7 +289,8 @@ def accept_diff(
     data = load_baseline(target)
     entry = {
         "fingerprint": compute_fingerprint(
-            lp, rp, effective_xml_ignore(display_path, data), strip_retrieve_defaults(data),
+            lp, rp, effective_xml_ignore(display_path, data),
+            strip_retrieve_defaults(data), managed_namespaces,
             left_root=left_root, right_root=right_root,
         ),
         "accepted_at": _cfg.ts_local(),
@@ -397,6 +406,7 @@ def classify_entry(
     rp: Path | None,
     baseline: dict[str, Any],
     pair_key: str | None = None,
+    managed_namespaces: frozenset[str] | None = None,
     *,
     left_root: Path | None = None,
     right_root: Path | None = None,
@@ -423,7 +433,7 @@ def classify_entry(
         try:
             current = compute_fingerprint(
                 lp, rp, effective_xml_ignore(display_path, baseline),
-                strip_retrieve_defaults(baseline),
+                strip_retrieve_defaults(baseline), managed_namespaces,
                 left_root=left_root, right_root=right_root,
             )
         except FingerprintReadError:

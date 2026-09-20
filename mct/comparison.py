@@ -26,8 +26,68 @@ from mct.snapshot import (
 )
 
 
+def managed_namespaces_for_org(org_alias: str) -> frozenset[str]:
+    """Installed-package namespaces for *org_alias*, from the newest
+    installed-packages snapshot of that org. Empty when none exists — the
+    caller must not assume components are unmanaged."""
+    try:
+        rows = load_index().get("snapshots") or []
+    except Exception:
+        return frozenset()
+    best: dict[str, Any] | None = None
+    for row in rows:
+        if (row.get("type") == "installed_packages"
+                and row.get("org_alias") == org_alias):
+            if best is None or str(row.get("created_at", "")) > str(
+                best.get("created_at", "")
+            ):
+                best = row
+    rel = (best or {}).get("path")
+    if not rel:
+        return frozenset()
+    path = (_cfg.STORAGE_ROOT / rel).resolve()
+    if not path.is_file():
+        path = (_cfg.PROJECT_ROOT / rel).resolve()
+    try:
+        pkg_rows = load_installed_packages_json(path)
+    except (OSError, json.JSONDecodeError):
+        return frozenset()
+    out: set[str] = set()
+    for r in pkg_rows:
+        ns = str(r.get("SubscriberPackageNamespace") or r.get("namespace") or "").strip()
+        if ns:
+            out.add(ns.casefold())
+    return frozenset(out)
+
+
+def managed_namespaces_for(
+    left_info: dict[str, Any] | None, right_info: dict[str, Any] | None
+) -> frozenset[str]:
+    """Union of installed-package namespaces across the org-backed sides."""
+    out: set[str] = set()
+    for info in (left_info, right_info):
+        if info and info.get("org_alias"):
+            out |= set(managed_namespaces_for_org(info["org_alias"]))
+    return frozenset(out)
+
+
+def managed_namespace_of(display: str, managed: frozenset[str]) -> str | None:
+    """The managed-package namespace a display path's component belongs to —
+    ``objects/Account/fields/LLC_BI__F__c.field-meta.xml`` → ``llc_bi``.
+    ``None`` when the component is unmanaged or namespaces are unknown.
+    ``Foo__c`` alone is never a namespace (suffix, not prefix)."""
+    from mct.xml_normalizer import managed_ns_of_name
+
+    name = display.rsplit("/", 1)[-1].split(".", 1)[0]
+    return managed_ns_of_name(name, managed)
+
+
 def _classify_result(
-    result: Any, baseline: dict[str, Any], pair_key: str | None = None
+    result: Any,
+    baseline: dict[str, Any],
+    pair_key: str | None = None,
+    managed_left: frozenset[str] | None = None,
+    managed_right: frozenset[str] | None = None,
 ) -> dict[str, list[Any]]:
     """Split a TreeCompareResult into active / ignored / accepted per the baseline.
 
@@ -46,10 +106,12 @@ def _classify_result(
 
     lroot = getattr(result, "left_root", None)
     rroot = getattr(result, "right_root", None)
+    managed_union = (managed_left or frozenset()) | (managed_right or frozenset())
 
     for lp, rp, ld, _ in result.differ_pairs:
         status, detail = _bl.classify_entry(
             ld, lp, rp, baseline, pair_key=pair_key,
+            managed_namespaces=managed_union or None,
             left_root=lroot, right_root=rroot,
         )
         if status == "ignored":
@@ -63,8 +125,15 @@ def _classify_result(
 
     for k in result.only_left_keys:
         lp, disp = result.left_ix[k]
+        # Managed-package components present only on an org side are
+        # installation drift, not source drift — classify before baseline.
+        ns = managed_namespace_of(disp, managed_left or frozenset())
+        if ns is not None:
+            ignored_files.append({"path": disp, "rule": f"managed:{ns}"})
+            continue
         status, detail = _bl.classify_entry(
             disp, lp, None, baseline, pair_key=pair_key,
+            managed_namespaces=managed_union or None,
             left_root=lroot, right_root=rroot,
         )
         if status == "ignored":
@@ -78,8 +147,13 @@ def _classify_result(
 
     for k in result.only_right_keys:
         rp, disp = result.right_ix[k]
+        ns = managed_namespace_of(disp, managed_right or frozenset())
+        if ns is not None:
+            ignored_files.append({"path": disp, "rule": f"managed:{ns}"})
+            continue
         status, detail = _bl.classify_entry(
             disp, None, rp, baseline, pair_key=pair_key,
+            managed_namespaces=managed_union or None,
             left_root=lroot, right_root=rroot,
         )
         if status == "ignored":
@@ -137,9 +211,23 @@ def run_diff(
     ignore_elements = _bl.xml_ignore_elements(baseline) or None
     ignore_by_type = _bl.xml_ignore_by_type(baseline) or None
 
+    # Installed-package namespaces of the org-backed side(s): managed
+    # components a source manifest cannot express are classified apart, and
+    # profile grants referencing them are normalised away.
+    managed_left = (
+        managed_namespaces_for_org(left_info["org_alias"])
+        if left_info and left_info.get("org_alias") else frozenset()
+    )
+    managed_right = (
+        managed_namespaces_for_org(right_info["org_alias"])
+        if right_info and right_info.get("org_alias") else frozenset()
+    )
+    managed_union = managed_left | managed_right
+
     result = compare_trees(
         left_abs, right_abs, ignore_elements, _bl.strip_retrieve_defaults(baseline),
         xml_ignore_by_type=ignore_by_type,
+        managed_namespaces=managed_union or None,
     )
 
     def _type_of(display: str) -> str:
@@ -150,7 +238,10 @@ def run_diff(
 
     # Baseline classification: ignored/accepted drift is reported separately
     # and does not trip fail-on-diff; accepted-but-changed entries resurface.
-    cls = _classify_result(result, baseline, pair_key=pair_key)
+    cls = _classify_result(
+        result, baseline, pair_key=pair_key,
+        managed_left=managed_left, managed_right=managed_right,
+    )
     different_files = cls["different_files"]
     only_left_files = cls["only_left_files"]
     only_right_files = cls["only_right_files"]
@@ -779,15 +870,27 @@ def run_compare_matrix(
             right_rel = resolve_snapshot_or_path(right)
             left_abs = abs_snapshot_or_project_rel(left_rel)
             right_abs = abs_snapshot_or_project_rel(right_rel)
+            left_info = _snapshot_provenance(left)
+            right_info = _snapshot_provenance(right)
+            managed_left = (
+                managed_namespaces_for_org(left_info["org_alias"])
+                if left_info and left_info.get("org_alias") else frozenset()
+            )
+            managed_right = (
+                managed_namespaces_for_org(right_info["org_alias"])
+                if right_info and right_info.get("org_alias") else frozenset()
+            )
             result = compare_trees(
                 left_abs, right_abs, ignore_elements,
                 _bl.strip_retrieve_defaults(baseline),
                 xml_ignore_by_type=ignore_by_type,
+                managed_namespaces=(managed_left | managed_right) or None,
             )
-            pair_key = _bl.pair_key_for(
-                _snapshot_provenance(left), _snapshot_provenance(right)
+            pair_key = _bl.pair_key_for(left_info, right_info)
+            cls = _classify_result(
+                result, baseline, pair_key=pair_key,
+                managed_left=managed_left, managed_right=managed_right,
             )
-            cls = _classify_result(result, baseline, pair_key=pair_key)
             different = len(cls["different_files"])
             only_left = len(cls["only_left_files"])
             only_right = len(cls["only_right_files"])
