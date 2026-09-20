@@ -47,6 +47,7 @@ from mct.xml_normalizer import _MAX_XML_BYTES
 from mct.ui_server_base import BaseUIHandler, serve_ui
 
 import mct.baseline as _baseline
+import mct.config as _cfg
 import mct.delta as _delta
 
 UI_DIR = _SCRIPT_DIR / "ui"
@@ -644,7 +645,7 @@ class DiffUIHandler(BaseUIHandler):
     right_root: Path
     left_rel: str
     right_rel: str
-    api_version: str = "66.0"
+    api_version: str = _cfg.DEFAULT_API_VERSION
     # Snapshot provenance (id/type/created_at/manifest_kind/branch/org_alias),
     # None when the tree was given as a plain path rather than a snapshot id.
     left_info: dict | None = None
@@ -1364,7 +1365,7 @@ class DiffUIHandler(BaseUIHandler):
 # ---------------------------------------------------------------------------
 
 def make_handler(left_root: Path, right_root: Path, left_rel: str, right_rel: str,
-                 api_version: str = "66.0",
+                 api_version: str = _cfg.DEFAULT_API_VERSION,
                  left_info: dict | None = None, right_info: dict | None = None):
     class _Handler(DiffUIHandler):
         pass
@@ -1402,8 +1403,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--right", required=True, metavar="PATH", help="Right tree (repo-relative or absolute).")
     p.add_argument("--port", type=int, default=8089, help="Port to serve on (default: 8089).")
     p.add_argument("--no-open", action="store_true", help="Do not auto-open the browser.")
-    p.add_argument("--api-version", default="66.0",
-                   help="Metadata API version stamped into exported manifests (default: 66.0).")
+    p.add_argument("--api-version", default=_cfg.default_api_version(),
+                   help="Metadata API version stamped into exported manifests "
+                        "(default: sfdx-project.json sourceApiVersion, else "
+                        f"{_cfg.DEFAULT_API_VERSION}).")
     p.add_argument("--left-info", default=None, metavar="JSON",
                    help="Snapshot provenance JSON for the left tree (id/type/created_at/manifest_kind/...).")
     p.add_argument("--right-info", default=None, metavar="JSON",

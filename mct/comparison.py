@@ -424,7 +424,7 @@ def run_ui(
         "--port",
         str(port),
         "--api-version",
-        api_version or _cfg.DEFAULT_API_VERSION,
+        api_version or _cfg.default_api_version(),
     ]
     for t in include_types or []:
         if t and str(t).strip():

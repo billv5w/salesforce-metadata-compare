@@ -62,11 +62,14 @@ INDEX_PATH = _cfg.INDEX_PATH
 COMPARISON_INDEX_PATH = _cfg.COMPARISON_INDEX_PATH
 MANIFEST_DIR = _cfg.MANIFEST_DIR
 DEFAULT_API_VERSION = _cfg.DEFAULT_API_VERSION
+DEFAULT_RETRIEVE_WAIT_SECONDS = _cfg.DEFAULT_RETRIEVE_WAIT_SECONDS
 _LEGACY_SOURCE_SUBDIR = _cfg._LEGACY_SOURCE_SUBDIR
 READ_ONLY_GIT_REMOTE = _cfg.READ_ONLY_GIT_REMOTE
 
 # --- config functions ---
 normalize_api_version = _cfg.normalize_api_version
+default_api_version = _cfg.default_api_version
+project_source_api_version = _cfg.project_source_api_version
 _storage_key = _cfg._storage_key
 repo_context = _cfg.repo_context
 sanitize_token = _cfg.sanitize_token
@@ -244,9 +247,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--api-version",
-        default=DEFAULT_API_VERSION,
+        default=None,
         metavar="VER",
-        help=f"Metadata API version for manifest generation and retrieve (default: {DEFAULT_API_VERSION}).",
+        help="Metadata API version for manifest generation and retrieve "
+             "(default: sfdx-project.json sourceApiVersion, "
+             f"else {DEFAULT_API_VERSION}).",
     )
     p.add_argument(
         "--retrieve-chunk-size",
@@ -287,7 +292,13 @@ def parse_args() -> argparse.Namespace:
         help="Override single-package subdir. Default: auto-detect from sfdx-project.json.",
     )
     sp_src.add_argument("--fetch", action="store_true")
-    sp_src.add_argument("--wait-seconds", type=int, default=120)
+    sp_src.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=DEFAULT_RETRIEVE_WAIT_SECONDS,
+        help="Seconds to wait per sf retrieve request before timing out "
+             "(passed to -w in minutes). Default %(default)s.",
+    )
     sp_src.set_defaults(_fn="snapshot_org_from_source")
 
     sp_ret_src = sub.add_parser(
@@ -301,12 +312,24 @@ def parse_args() -> argparse.Namespace:
         metavar="ID",
         help="Existing branch snapshot id from the index (from snapshot-branch or list).",
     )
-    sp_ret_src.add_argument("--wait-seconds", type=int, default=120)
+    sp_ret_src.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=DEFAULT_RETRIEVE_WAIT_SECONDS,
+        help="Seconds to wait per sf retrieve request before timing out "
+             "(passed to -w in minutes). Default %(default)s.",
+    )
     sp_ret_src.set_defaults(_fn="retrieve_org_from_branch_snapshot")
 
     sp_org = sub.add_parser("snapshot-org-from-org", help="Retrieve everything an org reports for its metadata types.")
     sp_org.add_argument("--org", required=True, help="Salesforce org alias.")
-    sp_org.add_argument("--wait-seconds", type=int, default=120)
+    sp_org.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=DEFAULT_RETRIEVE_WAIT_SECONDS,
+        help="Seconds to wait per sf retrieve request before timing out "
+             "(passed to -w in minutes). Default %(default)s.",
+    )
     sp_org.set_defaults(_fn="snapshot_org_from_org")
 
     sp_bidi = sub.add_parser(
@@ -325,7 +348,13 @@ def parse_args() -> argparse.Namespace:
         help="Override single-package subdir. Default: auto-detect from sfdx-project.json.",
     )
     sp_bidi.add_argument("--fetch", action="store_true")
-    sp_bidi.add_argument("--wait-seconds", type=int, default=120)
+    sp_bidi.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=DEFAULT_RETRIEVE_WAIT_SECONDS,
+        help="Seconds to wait per sf retrieve request before timing out "
+             "(passed to -w in minutes). Default %(default)s.",
+    )
     sp_bidi.add_argument(
         "--include-org-type",
         action="append",
@@ -350,7 +379,13 @@ def parse_args() -> argparse.Namespace:
     sp_rdelta.add_argument("--right", required=True, metavar="PATH|SNAP_ID",
                            help="Org tree (e.g. org retrieve snapshot id).")
     sp_rdelta.add_argument("--org", required=True, help="Salesforce org alias to retrieve from.")
-    sp_rdelta.add_argument("--wait-seconds", type=int, default=120)
+    sp_rdelta.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=DEFAULT_RETRIEVE_WAIT_SECONDS,
+        help="Seconds to wait per sf retrieve request before timing out "
+             "(passed to -w in minutes). Default %(default)s.",
+    )
     sp_rdelta.add_argument("--no-baseline", action="store_true",
                            help="Also pull drift that the baseline ignores/accepts.")
     sp_rdelta.set_defaults(_fn="retrieve_delta")
@@ -369,7 +404,13 @@ def parse_args() -> argparse.Namespace:
     sp_val.add_argument("--right", required=True, metavar="PATH|SNAP_ID",
                         help="Target-org tree (defines the delta).")
     sp_val.add_argument("--org", required=True, help="Org alias to validate against.")
-    sp_val.add_argument("--wait-seconds", type=int, default=600)
+    sp_val.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=DEFAULT_RETRIEVE_WAIT_SECONDS,
+        help="Seconds to wait per sf deploy validation request before timing "
+             "out (passed to -w in minutes). Default %(default)s.",
+    )
     sp_val.add_argument("--strip-no-grant", action="store_true",
                         help="Strip Profile/PermissionSet entries that grant nothing "
                              "(editable/readable both false, enabled=false, hidden tabs…) "
@@ -394,7 +435,13 @@ def parse_args() -> argparse.Namespace:
         help="Override single-package subdir. Default: auto-detect from sfdx-project.json.",
     )
     sp_all.add_argument("--fetch", action="store_true")
-    sp_all.add_argument("--wait-seconds", type=int, default=120)
+    sp_all.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=DEFAULT_RETRIEVE_WAIT_SECONDS,
+        help="Seconds to wait per sf retrieve request before timing out "
+             "(passed to -w in minutes). Default %(default)s.",
+    )
     sp_all.set_defaults(_fn="snapshot_all")
 
     sp_ui = sub.add_parser("ui", help="Open the diff viewer for two snapshots or folders.")
@@ -603,7 +650,7 @@ def main() -> int:
     if getattr(args, "retrieve_chunk_size", None) is not None:
         _cfg.RETRIEVE_CHUNK_SIZE = max(0, args.retrieve_chunk_size)
     api_ver = normalize_api_version(
-        (getattr(args, "api_version", None) or DEFAULT_API_VERSION).strip() or DEFAULT_API_VERSION
+        (getattr(args, "api_version", None) or "").strip() or _cfg.default_api_version()
     )
     if args._fn in _NEEDS_DX_PROJECT:
         _cfg.require_dx_project()

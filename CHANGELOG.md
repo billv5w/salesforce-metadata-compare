@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Changed
+
+- `--api-version` now defaults to the DX project's `sfdx-project.json` `sourceApiVersion` (falling back to 66.0) instead of always 66.0, avoiding "type is unknown" retrieve warnings on projects authored against newer API versions. The web UI omits the flag when the workspace leaves it blank so the same resolution applies; exported manifests are stamped with the resolved version.
+- `--wait-seconds` default raised from 120 to 600 for retrieve commands — a 4000-member manifest chunk can exceed two minutes on large orgs. The orchestrator's per-task timeout now scales with `wait_seconds` so chunked retrieves are not killed mid-run.
+
 ## [0.1.0] - 2026-09-19
 
 Initial public release.

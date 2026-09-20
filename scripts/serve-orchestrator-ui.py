@@ -25,7 +25,6 @@ UI_DIR = Path(__file__).resolve().parent / "ui"
 ENV_COMPARE = Path(__file__).resolve().parent / "env-compare.py"
 WORKSPACES_PATH = _cfg.workspaces_path()
 WORKSPACES_DIR = WORKSPACES_PATH.parent
-DEFAULT_API_VERSION = "66.0"
 TASK_CLEANUP_SECS = 300
 
 _tasks: dict[str, dict] = {}
@@ -39,13 +38,28 @@ def repo_cmd_prefix(repo_root: str | None) -> list[str]:
 
 
 def retrieve_cmd_prefix(repo_root: str | None, payload: dict) -> list[str]:
-    """repo-root + Metadata API version for manifest/retrieve snapshot commands."""
+    """repo-root + Metadata API version for manifest/retrieve snapshot commands.
+
+    When the payload carries no api_version the flag is omitted so the CLI
+    resolves the project's sfdx-project.json sourceApiVersion itself."""
     out = list(repo_cmd_prefix(repo_root))
-    v = (payload.get("api_version") or DEFAULT_API_VERSION).strip() or DEFAULT_API_VERSION
-    if "." not in v:
-        v = f"{v}.0"
-    out.extend(["--api-version", v])
+    v = (payload.get("api_version") or "").strip()
+    if v:
+        if "." not in v:
+            v = f"{v}.0"
+        out.extend(["--api-version", v])
     return out
+
+
+def snapshot_sse_timeout(payload: dict) -> int:
+    """Overall cap for a snapshot subprocess. Each manifest chunk may
+    legitimately run for the full wait-seconds; allow ~12 chunks of headroom
+    (snapshot-all runs two chunked retrieves) before calling the run hung."""
+    try:
+        wait = int(payload.get("wait_seconds") or _cfg.DEFAULT_RETRIEVE_WAIT_SECONDS)
+    except (TypeError, ValueError):
+        wait = _cfg.DEFAULT_RETRIEVE_WAIT_SECONDS
+    return max(600, wait * 12)
 
 
 def run_streaming(cmd: list[str], task_id: str, timeout: int = 600):
@@ -342,7 +356,7 @@ class Handler(BaseUIHandler):
                     "snapshot-org-from-source",
                     "--org", payload.get("org", ""),
                     "--branch", payload.get("branch", ""),
-                    "--wait-seconds", str(payload.get("wait_seconds", 120)),
+                    "--wait-seconds", str(payload.get("wait_seconds", _cfg.DEFAULT_RETRIEVE_WAIT_SECONDS)),
                 ]
                 if payload.get("fetch"):
                     cmd.append("--fetch")
@@ -356,7 +370,7 @@ class Handler(BaseUIHandler):
                     *retrieve_cmd_prefix(rr, payload),
                     "snapshot-org-from-org",
                     "--org", payload.get("org", ""),
-                    "--wait-seconds", str(payload.get("wait_seconds", 120)),
+                    "--wait-seconds", str(payload.get("wait_seconds", _cfg.DEFAULT_RETRIEVE_WAIT_SECONDS)),
                 ]
             elif action == "snapshot-org-bidirectional":
                 err = self._validate_payload_fields(payload, "branch", "org")
@@ -369,7 +383,7 @@ class Handler(BaseUIHandler):
                     "snapshot-org-bidirectional",
                     "--org", payload.get("org", ""),
                     "--branch", payload.get("branch", ""),
-                    "--wait-seconds", str(payload.get("wait_seconds", 120)),
+                    "--wait-seconds", str(payload.get("wait_seconds", _cfg.DEFAULT_RETRIEVE_WAIT_SECONDS)),
                 ]
                 if payload.get("fetch"):
                     cmd.append("--fetch")
@@ -387,14 +401,16 @@ class Handler(BaseUIHandler):
                     "snapshot-all",
                     "--branch", payload.get("branch", ""),
                     "--org", payload.get("org", ""),
-                    "--wait-seconds", str(payload.get("wait_seconds", 120)),
+                    "--wait-seconds", str(payload.get("wait_seconds", _cfg.DEFAULT_RETRIEVE_WAIT_SECONDS)),
                 ]
                 if payload.get("fetch"):
                     cmd.append("--fetch")
             else:
                 self._serve_json({"ok": False, "error": f"Unknown action: {action}"}, 400)
                 return
-            self._serve_sse(run_streaming(cmd, task_id))
+            self._serve_sse(
+                run_streaming(cmd, task_id, timeout=snapshot_sse_timeout(payload))
+            )
             return
 
         if parsed.path == "/api/snapshot-branch":
@@ -584,8 +600,9 @@ class Handler(BaseUIHandler):
                 "repo_root": (payload.get("repo_root") or "").strip(),
                 "branch": (payload.get("branch") or "").strip(),
                 "org": (payload.get("org") or "").strip(),
-                "api_version": (payload.get("api_version") or DEFAULT_API_VERSION).strip()
-                or DEFAULT_API_VERSION,
+                # Empty means "auto": retrieves resolve the project's
+                # sfdx-project.json sourceApiVersion at run time.
+                "api_version": (payload.get("api_version") or "").strip(),
                 "created_at": datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ"),
             }
             ws_data = load_workspaces()

@@ -662,3 +662,64 @@ class TestRunUiRecordsHistory(unittest.TestCase):
 
         # The important thing: record_comparison was called
         self.assertGreater(len(recorded), 0, "record_comparison should have been called by run_ui")
+
+
+# ---------------------------------------------------------------------------
+# Default Metadata API version and retrieve wait defaults
+# ---------------------------------------------------------------------------
+
+class TestDefaultApiVersion:
+    """--api-version should default to the DX project's sourceApiVersion, not a
+    hardcoded value — a stale default produced 'Settings type is unknown'
+    retrieve warnings against a v67 project (observed live)."""
+
+    def test_project_source_api_version_wins(self, tmp_path, monkeypatch):
+        import mct.config as _cfg
+        monkeypatch.setattr(_cfg, "PROJECT_ROOT", tmp_path)
+        (tmp_path / "sfdx-project.json").write_text(
+            json.dumps({"sourceApiVersion": "67.0"}), encoding="utf-8"
+        )
+        assert _cfg.default_api_version() == "67.0"
+
+    def test_numeric_source_api_version_normalized(self, tmp_path, monkeypatch):
+        import mct.config as _cfg
+        monkeypatch.setattr(_cfg, "PROJECT_ROOT", tmp_path)
+        (tmp_path / "sfdx-project.json").write_text(
+            json.dumps({"sourceApiVersion": 67}), encoding="utf-8"
+        )
+        assert _cfg.default_api_version() == "67.0"
+
+    def test_falls_back_without_sfdx_project(self, tmp_path, monkeypatch):
+        import mct.config as _cfg
+        monkeypatch.setattr(_cfg, "PROJECT_ROOT", tmp_path)
+        assert _cfg.default_api_version() == _cfg.DEFAULT_API_VERSION
+
+    def test_falls_back_on_unparseable_json(self, tmp_path, monkeypatch):
+        import mct.config as _cfg
+        monkeypatch.setattr(_cfg, "PROJECT_ROOT", tmp_path)
+        (tmp_path / "sfdx-project.json").write_text("{oops", encoding="utf-8")
+        assert _cfg.default_api_version() == _cfg.DEFAULT_API_VERSION
+
+    def test_cli_flag_unset_defaults_to_none(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", ["env-compare.py", "list"])
+        assert env_compare.parse_args().api_version is None
+
+
+class TestRetrieveWaitDefault:
+    """Default per-request wait must cover a chunked retrieve — 120s timed out
+    live on a 15k-member manifest (4 chunks, ~4 min for the last chunk)."""
+
+    def test_snapshot_all_default_is_chunk_safe(self, monkeypatch):
+        monkeypatch.setattr(
+            sys, "argv",
+            ["env-compare.py", "snapshot-all", "--branch", "b", "--org", "o"],
+        )
+        assert env_compare.parse_args().wait_seconds == 600
+
+    def test_snapshot_org_from_source_default_is_chunk_safe(self, monkeypatch):
+        monkeypatch.setattr(
+            sys, "argv",
+            ["env-compare.py", "snapshot-org-from-source",
+             "--branch", "b", "--org", "o"],
+        )
+        assert env_compare.parse_args().wait_seconds == 600

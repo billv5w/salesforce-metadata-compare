@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -77,6 +78,10 @@ INDEX_PATH = STATE_DIR / "snapshots.json"
 COMPARISON_INDEX_PATH = STATE_DIR / "comparisons.json"
 MANIFEST_DIR = PROJECT_ROOT / "manifest"
 DEFAULT_API_VERSION = "66.0"
+# Per-request wait passed to `sf project retrieve start -w` (converted to
+# minutes). 120s proved too short for a single 4000-member chunk on a large
+# org (~4 min observed); docs already recommend 300-600.
+DEFAULT_RETRIEVE_WAIT_SECONDS = 600
 # Manifests over this many members retrieve in multiple requests (the
 # Metadata API caps a single retrieve at ~10,000 files / 39 MB zipped;
 # source format runs ~1-2 files per member). 0 disables chunking.
@@ -92,6 +97,25 @@ def normalize_api_version(v: str) -> str:
     if "." not in s:
         return f"{s}.0"
     return s
+
+
+def project_source_api_version() -> str | None:
+    """sourceApiVersion declared by the DX project's sfdx-project.json, or None."""
+    try:
+        data = json.loads(
+            (PROJECT_ROOT / "sfdx-project.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return None
+    v = str(data.get("sourceApiVersion") or "").strip()
+    return normalize_api_version(v) if v else None
+
+
+def default_api_version() -> str:
+    """Default Metadata API version: the DX project's sourceApiVersion when
+    declared, else DEFAULT_API_VERSION. Retrieving at the version the source
+    was authored against avoids 'type is unknown' warnings on newer types."""
+    return project_source_api_version() or DEFAULT_API_VERSION
 
 
 def _storage_key(project_root: Path) -> str:
