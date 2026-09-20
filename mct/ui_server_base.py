@@ -28,6 +28,7 @@ from __future__ import annotations
 import errno
 import json
 import secrets
+import select
 import socketserver
 import sys
 import threading
@@ -78,7 +79,7 @@ class BaseUIHandler(SimpleHTTPRequestHandler):
     def handle_one_request(self):
         try:
             super().handle_one_request()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             pass
 
     # ------------------------------------------------------------------
@@ -105,15 +106,19 @@ class BaseUIHandler(SimpleHTTPRequestHandler):
         self._dispatch("HEAD")
 
     def _dispatch(self, verb: str):
-        if not self._guard():
-            return
-        route = getattr(self, f"_route_{verb}", None)
-        if route is None:
-            # OPTIONS (and any unimplemented verb) get no CORS headers — the
-            # browser treats that as a failed preflight for foreign pages.
-            self.send_error(405)
-            return
-        route()
+        self._body_drained = False
+        try:
+            if not self._guard():
+                return
+            route = getattr(self, f"_route_{verb}", None)
+            if route is None:
+                # OPTIONS (and any unimplemented verb) get no CORS headers — the
+                # browser treats that as a failed preflight for foreign pages.
+                self.send_error(405)
+                return
+            route()
+        finally:
+            self._drain_request_body()
 
     # ------------------------------------------------------------------
     # Guard checks
@@ -222,8 +227,10 @@ class BaseUIHandler(SimpleHTTPRequestHandler):
                 {"ok": False, "error": "Content-Type must be application/json"}, 415
             )
             return None
+        raw = self.rfile.read(length)
+        self._body_drained = True
         try:
-            data = json.loads(self.rfile.read(length).decode("utf-8"))
+            data = json.loads(raw.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._serve_json({"ok": False, "error": "Malformed JSON body"}, 400)
             return None
@@ -233,6 +240,48 @@ class BaseUIHandler(SimpleHTTPRequestHandler):
             )
             return None
         return data
+
+    def _drain_request_body(self):
+        """Discard unread request-body bytes so the socket close stays a clean
+        FIN. Handlers that never call ``_read_body`` (e.g. export-html) and
+        requests rejected by ``_guard`` leave the posted body in the socket's
+        kernel receive buffer — closing such a socket emits RST instead of FIN
+        on Windows, observed live as ConnectionResetError while the client was
+        still reading a large response. Reads are non-blocking with a short
+        readiness wait so a client that under-declared its body cannot hang the
+        single-threaded server. ``rfile``-prefetched bytes are already out of
+        the kernel buffer and need no attention."""
+        if getattr(self, "_body_drained", False):
+            return
+        self._body_drained = True
+        try:
+            remaining = int(self.headers.get("Content-Length") or "0")
+        except (ValueError, AttributeError):
+            return
+        remaining = min(remaining, MAX_BODY_BYTES)
+        if remaining <= 0:
+            return
+        sock = self.connection
+        try:
+            sock.setblocking(False)
+            while remaining > 0:
+                ready, _, _ = select.select([sock], [], [], 0.5)
+                if not ready:
+                    break
+                try:
+                    chunk = sock.recv(min(remaining, 65536))
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            pass
+        finally:
+            try:
+                sock.setblocking(True)
+            except OSError:
+                pass
 
     def _serve_json(self, data, status: int = 200, filename: str | None = None):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -276,7 +325,7 @@ class BaseUIHandler(SimpleHTTPRequestHandler):
                     msg = f"event: error\ndata: {item['data']}\n\n"
                 self.wfile.write(msg.encode("utf-8"))
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             pass
 
 

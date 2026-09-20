@@ -10,6 +10,7 @@ import http.client
 import importlib.util
 import json
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -21,7 +22,7 @@ _SCRIPTS_DIR = Path(__file__).parent.parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS_DIR))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from mct.ui_server_base import UIHTTPServer  # noqa: E402
+from mct.ui_server_base import BaseUIHandler, UIHTTPServer  # noqa: E402
 
 
 def _load(name: str, filename: str):
@@ -64,7 +65,8 @@ def _req(port, method, path, headers=None, body=None, skip_host=False):
             out = (res.status, dict(res.getheaders()), data)
             conn.close()
             return out
-        except (ConnectionResetError, http.client.RemoteDisconnected) as exc:
+        except (ConnectionResetError, ConnectionAbortedError,
+                http.client.RemoteDisconnected, TimeoutError) as exc:
             conn.close()
             last_exc = exc
             if attempt < 4:
@@ -333,6 +335,73 @@ class TestBodyValidation:
 # ---------------------------------------------------------------------------
 # Rejection happens before side effects
 # ---------------------------------------------------------------------------
+
+class TestRequestBodyDrain:
+    """Request bodies the handler never reads must be drained before socket
+    close — closing with data still in the kernel receive buffer emits RST
+    instead of FIN on Windows (observed live as ConnectionResetError while
+    the client was mid-read on the large export-html response)."""
+
+    def _handler(self, headers):
+        h = BaseUIHandler.__new__(BaseUIHandler)
+        h.headers = headers
+        return h
+
+    def test_unread_body_is_drained_from_socket(self):
+        a, b = socket.socketpair()
+        try:
+            handler = self._handler({"Content-Length": "5"})
+            handler.connection = a
+            b.sendall(b"hello")
+            BaseUIHandler._drain_request_body(handler)
+            b.shutdown(socket.SHUT_WR)
+            # Drain consumed the posted bytes — clean EOF, nothing left.
+            assert a.recv(16) == b""
+        finally:
+            a.close()
+            b.close()
+
+    def test_consumed_body_is_not_touched(self):
+        a, b = socket.socketpair()
+        try:
+            handler = self._handler({"Content-Length": "5"})
+            handler.connection = a
+            handler._body_drained = True
+            b.sendall(b"hello")
+            BaseUIHandler._drain_request_body(handler)
+            # Handler already read the body — drain must not consume more.
+            assert a.recv(16) == b"hello"
+        finally:
+            a.close()
+            b.close()
+
+    def test_no_content_length_is_noop(self):
+        a, b = socket.socketpair()
+        try:
+            handler = self._handler({})
+            handler.connection = a
+            b.sendall(b"x")
+            BaseUIHandler._drain_request_body(handler)
+            assert a.recv(8) == b"x"
+        finally:
+            a.close()
+            b.close()
+
+    def test_missing_body_bytes_do_not_block(self):
+        # Peer declared more than it sent — drain must give up, not hang the
+        # single-threaded server.
+        a, b = socket.socketpair()
+        try:
+            handler = self._handler({"Content-Length": "100"})
+            handler.connection = a
+            b.sendall(b"short")
+            t0 = time.monotonic()
+            BaseUIHandler._drain_request_body(handler)
+            assert time.monotonic() - t0 < 5
+        finally:
+            a.close()
+            b.close()
+
 
 class TestRejectBeforeSideEffects:
     def test_accept_diff_bad_token_no_baseline_write(self, diff_server):
