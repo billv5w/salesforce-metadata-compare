@@ -106,7 +106,10 @@ def _mock_sf(monkeypatch, resolver):
 def _default_resolver(batch):
     out: dict[str, list[str]] = {}
     for raw in batch:
-        p = raw.rstrip("/")
+        # The code under test passes absolute OS-native paths to sf — on
+        # Windows they use backslashes, which real sf accepts; normalize so
+        # the fake registry resolves them the same way.
+        p = raw.replace("\\", "/").rstrip("/")
         parts = p.split("/")
         if "classes" in parts:
             name = parts[-1]
@@ -336,7 +339,7 @@ class TestBundleCompleteness:
         def resolver(batch):
             return {
                 "CustomMetadata": [
-                    p.rsplit("/", 1)[-1].removesuffix(".md-meta.xml")
+                    p.replace("\\", "/").rsplit("/", 1)[-1].removesuffix(".md-meta.xml")
                     for p in batch
                 ]
             } if batch else {}

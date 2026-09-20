@@ -29,7 +29,9 @@ SF_NS = "http://soap.sforce.com/2006/04/metadata"
 
 def _write(path: Path, content: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    # Binary write: text mode would translate \n -> \r\n on Windows, so
+    # fixtures must go to disk byte-exact for line-ending assertions.
+    path.write_bytes(content.encode("utf-8"))
     return path
 
 

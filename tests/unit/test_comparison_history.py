@@ -223,8 +223,13 @@ class TestRecordComparison(unittest.TestCase):
         self.assertEqual(rec.identical_count, 10)
 
     def test_does_not_raise_on_ioerror(self):
-        """record_comparison never raises even when STATE_DIR is unwritable."""
-        env_compare.COMPARISON_INDEX_PATH = Path("/nonexistent/dir/comparisons.json")
+        """record_comparison never raises even when the index path is unwritable."""
+        # /nonexistent is only guaranteed unwritable on POSIX — on Windows CI
+        # it resolves to C:\nonexistent which admin runners can create. A path
+        # under a regular file is unwritable on every platform.
+        blocker = self.tmp_path / "blocker"
+        blocker.write_text("not a directory")
+        env_compare.COMPARISON_INDEX_PATH = blocker / "comparisons.json"
         result = self._make_result()
         # Should not raise
         rec = env_compare.record_comparison("left/path", "right/path", result)

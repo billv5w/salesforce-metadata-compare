@@ -102,7 +102,9 @@ class TestIndexTree:
 class TestCompareTrees:
     def _write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        # Binary write: text mode would translate \n -> \r\n on Windows, so
+        # fixtures must go to disk byte-exact for line-ending assertions.
+        path.write_bytes(content.encode("utf-8"))
 
     def test_identical_trees(self, tmp_path):
         left = tmp_path / "left"
@@ -253,7 +255,7 @@ class TestCompareTreesXmlSemanticEquality:
     @staticmethod
     def _write(path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        path.write_bytes(content.encode("utf-8"))
 
     def test_reordered_xml_elements_classified_as_identical(self, tmp_path):
         left = tmp_path / "left"
@@ -352,7 +354,7 @@ class TestCompareTreesJsonSemanticEquality:
     @staticmethod
     def _write(path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        path.write_bytes(content.encode("utf-8"))
 
     def test_reordered_json_keys_classified_as_identical(self, tmp_path):
         left = tmp_path / "left"

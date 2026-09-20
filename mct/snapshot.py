@@ -210,6 +210,11 @@ def _extract_archive_to(ref: str, subdir: str, out_dir: Path) -> None:
         if sys.version_info >= (3, 12):
             tf.extractall(path=out_dir, filter="data")
         else:
+            # Pre-3.12 extractall applies stored modes verbatim; sanitize them
+            # the way filter="data" does — strip suid/sgid/sticky bits and make
+            # dirs traversable and files readable regardless of archive modes.
+            for m in members:
+                m.mode = (m.mode | (0o755 if m.isdir() else 0o644)) & 0o777
             tf.extractall(path=out_dir, members=members)
 
 

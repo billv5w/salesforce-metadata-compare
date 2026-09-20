@@ -222,8 +222,12 @@ def test_exported_bundle_has_source_for_members(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _start_diff_server(left: Path, right: Path, data_dir: Path, timeout=20):
-    env = {**os.environ, "MCT_DATA_DIR": str(data_dir)}
+def _start_diff_server(left: Path, right: Path, data_dir: Path, timeout=60):
+    env = {
+        **os.environ,
+        "MCT_DATA_DIR": str(data_dir),
+        "PYTHONUNBUFFERED": "1",
+    }
     proc = subprocess.Popen(
         [
             sys.executable,

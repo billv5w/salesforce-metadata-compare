@@ -194,6 +194,11 @@ class TestOfflineReport:
         assert "%3C%2Fscript%3E" in html or "</script><img" not in html
         assert "<img src=x onerror" not in html
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows cannot create filenames containing <> — the escaping "
+        "guarantee is exercised on POSIX filesystems where such names exist",
+    )
     def test_paths_html_escaped(self, handler, tmp_path):
         """A path containing markup must not break out of the report DOM."""
         left, right = _trees(tmp_path)

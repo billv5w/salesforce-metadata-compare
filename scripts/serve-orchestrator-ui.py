@@ -480,7 +480,7 @@ class Handler(BaseUIHandler):
             threading.Thread(target=_drain_stderr, daemon=True).start()
             reader = threading.Thread(target=_read_until_url, daemon=True)
             reader.start()
-            reader.join(timeout=25.0)
+            reader.join(timeout=60.0)
             for line in lines:
                 if line.startswith("METADATA_COMPARE_DIFF_UI_URL="):
                     url = line.strip().split("=", 1)[1].strip()

@@ -28,6 +28,7 @@ from __future__ import annotations
 import errno
 import json
 import secrets
+import socketserver
 import sys
 import threading
 import webbrowser
@@ -51,6 +52,18 @@ class UIHTTPServer(HTTPServer):
     # Set by serve_ui() after binding — one unpredictable token per server
     # instance, read by the handler via self.server.session_token.
     session_token: str = ""
+
+    def server_bind(self):
+        # HTTPServer.server_bind resolves socket.getfqdn() on the bind address
+        # (a reverse DNS lookup) purely to fill self.server_name — it can stall
+        # for tens of seconds on hosts with broken PTR resolution (some CI
+        # runners), delaying the URL marker past the parent's timeout. We only
+        # ever bind a numeric loopback address and nothing reads server_name,
+        # so skip the lookup.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
 
 class BaseUIHandler(SimpleHTTPRequestHandler):

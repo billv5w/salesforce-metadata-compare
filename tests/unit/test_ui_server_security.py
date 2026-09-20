@@ -43,19 +43,27 @@ def _start(handler_cls, token=None):
 
 
 def _req(port, method, path, headers=None, body=None, skip_host=False):
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    if skip_host:
-        conn.putrequest(method, path, skip_host=True)
-        for k, v in (headers or {}).items():
-            conn.putheader(k, v)
-        conn.endheaders(body)
-    else:
-        conn.request(method, path, body=body, headers=headers or {})
-    res = conn.getresponse()
-    data = res.read()
-    out = (res.status, dict(res.getheaders()), data)
-    conn.close()
-    return out
+    # Windows occasionally reports an RST (WinError 10054) where POSIX would
+    # see a clean FIN — retry once on a fresh connection rather than flake.
+    for attempt in range(2):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            if skip_host:
+                conn.putrequest(method, path, skip_host=True)
+                for k, v in (headers or {}).items():
+                    conn.putheader(k, v)
+                conn.endheaders(body)
+            else:
+                conn.request(method, path, body=body, headers=headers or {})
+            res = conn.getresponse()
+            data = res.read()
+            out = (res.status, dict(res.getheaders()), data)
+            conn.close()
+            return out
+        except ConnectionResetError:
+            conn.close()
+            if attempt:
+                raise
 
 
 def _api_headers(port, token, extra=None):
