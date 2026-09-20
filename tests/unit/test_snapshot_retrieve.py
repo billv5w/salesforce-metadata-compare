@@ -410,14 +410,236 @@ class TestChunkedRetrieve:
                                      warn_on_call=2)
         assert any("skipped" in w for w in collected["warnings"])
 
-    def test_profile_scope_warning_when_chunked(self, tmp_path, monkeypatch):
-        types = {"Profile": {"Admin", "Standard"}, "ApexClass": {f"C{i}" for i in range(4)}}
-        calls, collected = self._run(tmp_path, monkeypatch, types, chunk_size=3)
-        assert any("Profile" in w and "scope" in w for w in collected["warnings"])
+    def test_no_profile_scope_warning_when_chunked(self, tmp_path, monkeypatch):
+        # Profiles get their own full-scope request now (see
+        # TestChunkedProfileScope), so chunking no longer hollows them out.
+        types = {"Profile": {"Admin"}, "ApexClass": {"C1", "C2"},
+                 "StaticResource": {"R1", "R2", "R3"}}
+        calls, collected = self._run(tmp_path, monkeypatch, types, chunk_size=4)
+        assert collected["warnings"] == []
+        assert len(calls) == 3  # 2 regular chunks + 1 scope request (3 members)
 
     def test_no_profile_warning_when_single_request(self, tmp_path, monkeypatch):
         types = {"Profile": {"Admin"}, "ApexClass": {"A"}}
         calls, collected = self._run(tmp_path, monkeypatch, types, chunk_size=100)
+        assert collected["warnings"] == []
+
+
+STUB = '<?xml version="1.0" encoding="UTF-8"?>\n<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata"></CustomObject>\n'
+FULL = '<?xml version="1.0" encoding="UTF-8"?>\n<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata"><sharingModel>Private</sharingModel></CustomObject>\n'
+
+
+class TestChunkedProfileScope:
+    """Observed live on a 19k-file FSC org (2026-09-20): a 4-chunk retrieve
+    produced 75 hollow Profiles and 93 two-line CustomObject stubs.
+
+    Two mechanisms, both from sharing one --output-dir across requests:
+
+    1. The Profile/PermissionSet-only chunk wrote an empty ``<CustomObject/>``
+       stub for every object a profile referenced, *overwriting* the full
+       object an earlier chunk had retrieved.
+    2. Profile content is scoped to the other members of the same request,
+       so a profiles-only chunk returned profiles with no field/class/tab
+       permissions at all.
+
+    Fix: each request retrieves into its own directory and is merged with a
+    stub-aware rule; Profile/PermissionSet go in a dedicated request that
+    also carries the manifest's scope-defining members, from which only the
+    profile files are kept.
+    """
+
+    NS = "http://soap.sforce.com/2006/04/metadata"
+    PROFILE_TYPES = {"Profile", "PermissionSet", "MutingPermissionSet"}
+
+    def _manifest(self, path, types):
+        body = "".join(
+            f"<types>{''.join(f'<members>{m}</members>' for m in sorted(ms))}<name>{t}</name></types>"
+            for t, ms in types.items()
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f'<?xml version="1.0" encoding="UTF-8"?><Package xmlns="{self.NS}">'
+            f"{body}<version>66.0</version></Package>", encoding="utf-8")
+        return path
+
+    def _run(self, tmp_path, monkeypatch, types, chunk_size):
+        """Fake ``sf`` that mimics the live behaviour: every request writes
+        the objects it was asked for in full, writes a *stub* for objects it
+        only saw referenced (via CustomField or via Profile), and writes
+        profiles whose content lists the request's own scope."""
+        monkeypatch.setattr(_cfg, "STORAGE_ROOT", tmp_path / "store")
+        monkeypatch.setattr(_cfg, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(_cfg, "RETRIEVE_CHUNK_SIZE", chunk_size, raising=False)
+        manifest = self._manifest(tmp_path / "manifest" / "package.xml", types)
+        requests: list[dict[str, set[str]]] = []
+
+        def fake_run(cmd, **kwargs):
+            req = snapshot.parse_manifest_types(tmp_path / cmd[cmd.index("--manifest") + 1])
+            requests.append(req)
+            out = Path(cmd[cmd.index("--output-dir") + 1])
+            objs = out / "objects"
+            for o in req.get("CustomObject", ()):
+                (objs / o).mkdir(parents=True, exist_ok=True)
+                (objs / o / f"{o}.object-meta.xml").write_text(FULL, encoding="utf-8")
+            referenced = {f.split(".")[0] for f in req.get("CustomField", ())}
+            for f in req.get("CustomField", ()):
+                o, name = f.split(".")
+                (objs / o / "fields").mkdir(parents=True, exist_ok=True)
+                (objs / o / "fields" / f"{name}.field-meta.xml").write_text("<CustomField/>", encoding="utf-8")
+            in_scope_request = bool(self.PROFILE_TYPES & set(req))
+            for c in req.get("ApexClass", ()):
+                (out / "classes").mkdir(parents=True, exist_ok=True)
+                (out / "classes" / f"{c}.cls").write_text(
+                    "SCOPE_REQUEST" if in_scope_request else "public class X {}", encoding="utf-8")
+            for ptype, folder, suffix in (
+                ("Profile", "profiles", "profile"),
+                ("PermissionSet", "permissionsets", "permissionset"),
+            ):
+                for p in req.get(ptype, ()):
+                    (out / folder).mkdir(parents=True, exist_ok=True)
+                    scope = sorted(req.get("CustomField", ())) + sorted(req.get("ApexClass", ()))
+                    (out / folder / f"{p}.{suffix}-meta.xml").write_text(
+                        "<Profile>" + "".join(f"<fieldPermissions>{s}</fieldPermissions>" for s in scope) + "</Profile>",
+                        encoding="utf-8")
+                    # Profiles reference every object in the org — the CLI
+                    # emits a stub for each one it has no body for.
+                    referenced |= set(types.get("CustomObject", ()))
+            for o in referenced - set(req.get("CustomObject", ())):
+                stub = objs / o / f"{o}.object-meta.xml"
+                stub.parent.mkdir(parents=True, exist_ok=True)
+                stub.write_text(STUB, encoding="utf-8")
+
+            class R:
+                stdout = json.dumps({"result": {"messages": [], "files": []}})
+                returncode = 0
+
+            return R()
+
+        monkeypatch.setattr(_cfg, "run", fake_run)
+        collected: dict = {}
+        out_dir = snapshot.retrieve_with_manifest(
+            manifest, "uat", "retrieved-org-scope", 120, "66.0", collected=collected
+        )
+        return out_dir, requests, collected
+
+    TYPES = {
+        "CustomObject": {"Account", "Foo__c"},
+        "CustomField": {"Account.A__c", "Account.B__c", "Foo__c.X__c"},
+        "ApexClass": {"C1", "C2"},
+        "StaticResource": {"R1", "R2", "R3"},
+        "Profile": {"Admin"},
+        "PermissionSet": {"PS1"},
+    }
+
+    def test_profile_chunk_does_not_clobber_full_objects(self, tmp_path, monkeypatch):
+        out_dir, requests, _ = self._run(tmp_path, monkeypatch, self.TYPES, chunk_size=3)
+        assert len(requests) > 1, "test needs a chunked retrieve"
+        for o in ("Account", "Foo__c"):
+            body = (out_dir / "objects" / o / f"{o}.object-meta.xml").read_text(encoding="utf-8")
+            assert "<sharingModel>" in body, f"{o} was reduced to a stub"
+
+    def test_stub_never_wins_over_body_regardless_of_order(self, tmp_path, monkeypatch):
+        # Fields sort before objects, so the field-only stub lands first;
+        # profiles retrieve last and write another stub. Both must lose.
+        out_dir, _, _ = self._run(tmp_path, monkeypatch, self.TYPES, chunk_size=2)
+        for o in ("Account", "Foo__c"):
+            body = (out_dir / "objects" / o / f"{o}.object-meta.xml").read_text(encoding="utf-8")
+            assert "<sharingModel>" in body
+        # Children merged from every chunk survive alongside the parent body.
+        assert (out_dir / "objects" / "Account" / "fields" / "A__c.field-meta.xml").is_file()
+        assert (out_dir / "objects" / "Account" / "fields" / "B__c.field-meta.xml").is_file()
+
+    def test_stub_kept_when_no_body_was_ever_retrieved(self, tmp_path, monkeypatch):
+        types = {
+            "CustomField": {"Bar__c.Z__c"},
+            "ApexClass": {"C1", "C2", "C3"},
+            "Profile": {"Admin"},
+        }
+        out_dir, _, _ = self._run(tmp_path, monkeypatch, types, chunk_size=2)
+        assert (out_dir / "objects" / "Bar__c" / "Bar__c.object-meta.xml").read_text(encoding="utf-8") == STUB
+
+    def test_profiles_retrieved_in_dedicated_full_scope_request(self, tmp_path, monkeypatch):
+        # 12 members, cap 9: regular 10 -> 2 chunks; scope request 9 -> under cap.
+        out_dir, requests, collected = self._run(tmp_path, monkeypatch, self.TYPES, chunk_size=9)
+        profile_reqs = [r for r in requests if self.PROFILE_TYPES & set(r)]
+        assert len(profile_reqs) == 1, "all profile types share one request"
+        req = profile_reqs[0]
+        assert req["Profile"] == {"Admin"} and req["PermissionSet"] == {"PS1"}
+        # The request carries the scope-defining members from the *whole*
+        # manifest, not just what fit in one chunk.
+        assert req["CustomField"] == self.TYPES["CustomField"]
+        assert req["CustomObject"] == self.TYPES["CustomObject"]
+        assert req["ApexClass"] == self.TYPES["ApexClass"]
+        # Regular chunks never carry profiles.
+        for r in requests:
+            if r is not req:
+                assert not (self.PROFILE_TYPES & set(r))
+        body = (out_dir / "profiles" / "Admin.profile-meta.xml").read_text(encoding="utf-8")
+        for m in sorted(self.TYPES["CustomField"]) + sorted(self.TYPES["ApexClass"]):
+            assert f"<fieldPermissions>{m}</fieldPermissions>" in body
+        assert not any("scope" in w for w in collected["warnings"])
+
+    def test_profile_request_is_last_and_counted(self, tmp_path, monkeypatch):
+        _, requests, collected = self._run(tmp_path, monkeypatch, self.TYPES, chunk_size=3)
+        assert self.PROFILE_TYPES & set(requests[-1])
+        assert collected["chunks"] == len(requests)
+
+    def test_scope_request_is_never_split_but_warns_when_over_cap(self, tmp_path, monkeypatch):
+        # Splitting is what hollows profiles out, so the scope request is
+        # sent whole even over the (member-count proxy) cap, with a warning.
+        types = {
+            "CustomObject": {"Account", "Foo__c"},
+            "CustomField": {f"Account.F{i}__c" for i in range(5)} | {"Foo__c.X__c"},
+            "Profile": {"Admin"},
+        }
+        _, requests, collected = self._run(tmp_path, monkeypatch, types, chunk_size=5)
+        req = [r for r in requests if "Profile" in r][0]
+        assert req["CustomField"] == types["CustomField"]
+        assert req["CustomObject"] == types["CustomObject"]
+        assert any("scope" in w and "LIMIT_EXCEEDED" in w for w in collected["warnings"])
+
+    def test_scope_request_carries_flowdefinitions(self):
+        # flowAccesses in a returned Profile are keyed on the FlowDefinition
+        # members in the request — Flow alone is not enough. Verified live on
+        # fsc-verified: Flow+FlowDefinition scope returned 584 flowAccesses
+        # per profile; Flow-only scope returned zero.
+        members = {
+            "Profile": {"Admin"},
+            "Flow": {"F1"},
+            "FlowDefinition": {"FD1"},
+        }
+        req, warn = snapshot.build_scope_request(members, 100)
+        assert req["FlowDefinition"] == {"FD1"}
+        assert warn is None
+
+    def test_scope_request_excludes_non_scope_types(self, tmp_path, monkeypatch):
+        types = {
+            "ApexClass": {"C1", "C2", "C3"},
+            "StaticResource": {"R1", "R2"},
+            "Profile": {"Admin"},
+        }
+        _, requests, _ = self._run(tmp_path, monkeypatch, types, chunk_size=2)
+        req = [r for r in requests if "Profile" in r][0]
+        assert "StaticResource" not in req and req["ApexClass"] == types["ApexClass"]
+
+    def test_scope_request_only_contributes_profile_files(self, tmp_path, monkeypatch):
+        # The dedicated request also returns objects/classes; those must come
+        # from the regular chunks so a failure mode there is not masked.
+        types = {
+            "CustomObject": {"Account"},
+            "ApexClass": {"C1", "C2", "C3"},
+            "Profile": {"Admin"},
+        }
+        out_dir, requests, _ = self._run(tmp_path, monkeypatch, types, chunk_size=2)
+        assert (out_dir / "profiles" / "Admin.profile-meta.xml").is_file()
+        for c in ("C1", "C2", "C3"):
+            assert (out_dir / "classes" / f"{c}.cls").read_text(encoding="utf-8") == "public class X {}"
+        assert sorted(p.name for p in out_dir.iterdir()) == ["classes", "objects", "profiles"]
+
+    def test_single_request_unchanged_when_under_cap(self, tmp_path, monkeypatch):
+        _, requests, collected = self._run(tmp_path, monkeypatch, self.TYPES, chunk_size=100)
+        assert len(requests) == 1
+        assert collected.get("chunks", 1) == 1
         assert collected["warnings"] == []
 
 

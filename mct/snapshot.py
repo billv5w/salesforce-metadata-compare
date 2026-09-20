@@ -499,30 +499,48 @@ def retrieve_with_manifest(
     last_payload = ""
     try:
         if chunk_size > 0 and total_members > chunk_size:
-            chunk_sets = split_manifest_members(members, chunk_size)
-            n_chunks = len(chunk_sets)
+            # Profile-like types get one dedicated request carrying the whole
+            # manifest's scope-defining members; the rest is greedy-packed.
+            regular = {t: m for t, m in members.items() if t not in SCOPE_DEPENDENT_TYPES}
+            chunk_sets = split_manifest_members(regular, chunk_size)
+            scope_req, scope_warn = build_scope_request(members, chunk_size)
+            has_scope = any(t in scope_req for t in SCOPE_DEPENDENT_TYPES)
+            n_chunks = len(chunk_sets) + (1 if has_scope else 0)
             print(
                 f"  Manifest has {total_members} members (over the {chunk_size}-member "
                 f"chunk cap) — retrieving in {n_chunks} requests.",
                 flush=True,
             )
-            if any(t in members for t in ("Profile", "PermissionSet")):
-                warnings.append(
-                    "chunked retrieve: Profile/PermissionSet content depends on the "
-                    "request scope — profiles may differ from a single-request retrieve"
-                )
-            for i, chunk_members in enumerate(chunk_sets, 1):
+            if has_scope and scope_warn:
+                warnings.append(scope_warn)
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            # Every request lands in its own directory and is merged
+            # stub-aware: a request that merely *references* a component
+            # (profiles do, for every object) writes an empty placeholder
+            # for it, which must not overwrite a body another request
+            # retrieved. Observed live: 93 CustomObjects reduced to
+            # <CustomObject/> by the profiles chunk.
+            plan: list[tuple[dict[str, set[str]], frozenset[str] | None]] = [
+                (cm, None) for cm in chunk_sets
+            ]
+            if has_scope:
+                plan.append((scope_req, _SCOPE_DEPENDENT_FOLDERS))
+            for i, (chunk_members, keep_dirs) in enumerate(plan, 1):
                 chunk_path = manifest.parent / f"{manifest.stem}-chunk{i}.xml"
                 write_manifest(chunk_path, chunk_members, api_version)
                 n_m = sum(len(m) for m in chunk_members.values())
-                print(f"  ▶ Chunk {i}/{n_chunks} ({n_m} members)", flush=True)
+                label = " (Profile/PermissionSet with full scope)" if keep_dirs else ""
+                print(f"  ▶ Chunk {i}/{n_chunks} ({n_m} members){label}", flush=True)
+                request_dir = staging_dir / f"request-{i}"
                 try:
                     chunk_warnings, last_payload = _retrieve_request(
-                        chunk_path, org_alias, staging_dir, timeout, api_version
+                        chunk_path, org_alias, request_dir, timeout, api_version
                     )
                     warnings += chunk_warnings
                 except RuntimeError as exc:
                     raise RuntimeError(f"chunk {i}/{n_chunks}: {exc}") from exc
+                if request_dir.is_dir():
+                    merge_retrieved_tree(request_dir, staging_dir, keep_dirs)
         else:
             single_warnings, last_payload = _retrieve_request(
                 manifest, org_alias, staging_dir, timeout, api_version
@@ -742,6 +760,100 @@ def split_manifest_members(
                     _flush()
     _flush()
     return chunks
+
+
+# Types whose retrieved content is a projection onto the *other* members of
+# the same request. Retrieved alone they come back hollow (observed live:
+# 75 profiles with zero fieldPermissions/classAccesses/tabVisibilities).
+SCOPE_DEPENDENT_TYPES: frozenset[str] = frozenset({
+    "Profile", "PermissionSet", "MutingPermissionSet",
+})
+
+# Source-format folders the scope-dependent types decompose into. Only these
+# are merged from the dedicated scope request; everything else it returns is
+# a duplicate of (or a stub for) what the regular chunks retrieved.
+_SCOPE_DEPENDENT_FOLDERS: frozenset[str] = frozenset({
+    "profiles", "permissionsets", "mutingpermissionsets",
+})
+
+# Types that define what a Profile/PermissionSet can grant on. Their members
+# ride along in the scope request so the returned profiles are complete.
+SCOPE_DEFINING_TYPES: frozenset[str] = frozenset({
+    "ApexClass", "ApexPage", "CustomApplication", "CustomField",
+    "CustomMetadata", "CustomObject", "CustomPermission", "CustomTab",
+    "DataCategoryGroup", "ExternalCredential", "ExternalDataSource", "Flow",
+    # flowAccesses in a returned Profile are keyed on the FlowDefinition
+    # members in the same request — Flow alone is not enough (observed live:
+    # profiles came back with zero flowAccesses when only Flow was scoped).
+    "FlowDefinition",
+    "Layout", "RecordType",
+})
+
+
+def build_scope_request(
+    members: dict[str, set[str]], max_members: int
+) -> tuple[dict[str, set[str]], str | None]:
+    """Members for the dedicated Profile/PermissionSet request: the profile
+    types plus every scope-defining member of the whole manifest.
+
+    The request is deliberately not split — splitting is what hollows
+    profiles out. The member cap is only a proxy for the Metadata API's
+    per-retrieve file/size limits (CustomField members fold into their
+    object's file), so an over-cap request is sent as-is with a warning.
+    Returns ``(request_members, warning_or_None)``.
+    """
+    req: dict[str, set[str]] = {
+        t: set(m) for t, m in members.items()
+        if (t in SCOPE_DEPENDENT_TYPES or t in SCOPE_DEFINING_TYPES) and m
+    }
+    n = sum(len(m) for m in req.values())
+    if max_members <= 0 or n <= max_members:
+        return req, None
+    return req, (
+        f"profile scope request has {n} members (over the {max_members} cap) — "
+        "it is sent whole because Profile/PermissionSet content depends on the "
+        "request scope; if it fails with LIMIT_EXCEEDED, narrow the manifest"
+    )
+
+
+def _is_empty_stub(path: Path) -> bool:
+    """True for the placeholder ``<Type/>`` file the CLI writes when a request
+    referenced a component (via a child or a profile) without retrieving its
+    body. Anything unparsable or with content is not a stub."""
+    import xml.etree.ElementTree as ET
+
+    try:
+        if path.stat().st_size > 512:
+            return False
+        root = ET.fromstring(path.read_bytes())
+    except (OSError, ET.ParseError):
+        return False
+    return len(root) == 0 and not (root.text or "").strip() and not root.attrib
+
+
+def merge_retrieved_tree(src: Path, dst: Path, only_top_dirs: frozenset[str] | None = None) -> int:
+    """Move *src* into *dst*, file by file. A file already in *dst* is kept
+    when the incoming one is an empty stub; a stub already in *dst* is
+    replaced by an incoming body. Otherwise the incoming file wins.
+
+    *only_top_dirs* restricts the merge to those first-level folders of
+    *src*. Returns the number of files placed. *src* is consumed.
+    """
+    placed = 0
+    for top in sorted(src.iterdir()):
+        if only_top_dirs is not None and top.name not in only_top_dirs:
+            continue
+        for p in sorted(top.rglob("*")) if top.is_dir() else [top]:
+            if not p.is_file():
+                continue
+            target = dst / p.relative_to(src)
+            if target.exists() and _is_empty_stub(p) and not _is_empty_stub(target):
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(p), str(target))
+            placed += 1
+    shutil.rmtree(src, ignore_errors=True)
+    return placed
 
 
 def build_union_manifest(

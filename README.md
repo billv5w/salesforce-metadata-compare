@@ -96,7 +96,7 @@ For data from an older installation, run `mct migrate --legacy-root /path/to/old
 
 - Comparison covers retrieved files. Missing or failed retrievals are not proof that a component was deleted from an org; inspect retrieval warnings and scope.
 - Namespaced managed-package round-trips are only partially supported. Source-manifest generation can drop a namespace prefix, causing a follow-on retrieve to omit that component.
-- Profile and PermissionSet contents depend on the request's metadata scope. Chunked retrievals record a scope warning for these types.
+- Profile and PermissionSet contents depend on the request's metadata scope. Chunked retrievals send these types in one dedicated request together with the manifest's scope-defining members (objects, fields, classes, tabs, FlowDefinitions, and so on). That request is never split; if it exceeds the chunk cap a warning is recorded and it is sent whole. Scope is still limited to manifest members — entries for org-only components (for example managed-package tabs) only appear when the manifest includes them, which `snapshot-org-bidirectional` does via its union manifest.
 - XML above the normalizer size cap is compared byte-for-byte and flagged as `normalization_skipped`. Order-sensitive structures are preserved; supported unordered XML collections and JSON object keys are normalized.
 - Accepting a difference is a comparison baseline decision, not a change to Salesforce metadata. Accepted entries can become stale when the compared content changes.
 - A nonempty snapshot or passing small-sample comparison does not establish full-org completeness or large-org performance.

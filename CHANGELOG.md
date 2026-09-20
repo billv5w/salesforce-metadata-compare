@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+
+- Chunked retrieves no longer hollow out Profiles and PermissionSets or overwrite retrieved objects with empty stubs. Each request now retrieves into its own directory and is merged stub-aware, and profile-like types are sent in one dedicated request that carries the manifest's scope-defining members. Observed on a 19k-file org: 75 profiles and 93 objects were reported as drift when the org matched the branch.
+
 ### Changed
 
 - `--api-version` now defaults to the DX project's `sfdx-project.json` `sourceApiVersion` (falling back to 66.0) instead of always 66.0, avoiding "type is unknown" retrieve warnings on projects authored against newer API versions. The web UI omits the flag when the workspace leaves it blank so the same resolution applies; exported manifests are stamped with the resolved version.
