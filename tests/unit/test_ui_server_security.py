@@ -12,6 +12,7 @@ import json
 import secrets
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -43,9 +44,12 @@ def _start(handler_cls, token=None):
 
 
 def _req(port, method, path, headers=None, body=None, skip_host=False):
-    # Windows occasionally reports an RST (WinError 10054) where POSIX would
-    # see a clean FIN — retry once on a fresh connection rather than flake.
-    for attempt in range(2):
+    # A closing server socket can surface as RST (WinError 10054 / Errno 104)
+    # or an abrupt EOF (RemoteDisconnected) instead of a clean FIN, sometimes
+    # mid-body on large responses — retry a few times on a fresh connection
+    # rather than flake.
+    last_exc: Exception | None = None
+    for attempt in range(5):
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
         try:
             if skip_host:
@@ -60,10 +64,12 @@ def _req(port, method, path, headers=None, body=None, skip_host=False):
             out = (res.status, dict(res.getheaders()), data)
             conn.close()
             return out
-        except ConnectionResetError:
+        except (ConnectionResetError, http.client.RemoteDisconnected) as exc:
             conn.close()
-            if attempt:
-                raise
+            last_exc = exc
+            if attempt < 4:
+                time.sleep(0.05 * (attempt + 1))
+    raise last_exc  # type: ignore[misc]
 
 
 def _api_headers(port, token, extra=None):
